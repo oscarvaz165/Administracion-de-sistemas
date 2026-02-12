@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -u
 
-SEG_NET="192.168.100.0"
-SEG_MASK="255.255.255.0"
-
 CONF="/etc/dhcpd.conf"
 LEASES_PRIMARY="/var/lib/dhcpd/dhcpd.leases"
 LEASES_FALLBACK="/var/lib/dhcp/dhcpd.leases"
@@ -15,6 +12,20 @@ ip_to_int() {
   local ip="$1" a b c d
   IFS=. read -r a b c d <<<"$ip" || return 1
   echo $(( (a<<24) + (b<<16) + (c<<8) + d ))
+}
+
+int_to_ip() {
+  local n="$1"
+  echo "$(( (n>>24)&255 )).$(( (n>>16)&255 )).$(( (n>>8)&255 )).$(( n&255 ))"
+}
+
+ip_add() {
+  local ip="$1" delta="$2"
+  local n
+  n=$(ip_to_int "$ip") || return 1
+  n=$(( n + delta ))
+  (( n>=0 && n<=4294967295 )) || return 1
+  int_to_ip "$n"
 }
 
 is_ipv4() {
@@ -30,13 +41,11 @@ is_ipv4() {
 }
 
 mask_is_valid() {
-  local m="$1"
+  local m="$1" mi inv
   is_ipv4 "$m" || return 1
-  local mi inv
   mi=$(ip_to_int "$m") || return 1
   (( mi != 0 && mi != 4294967295 )) || return 1
-  inv=$(( (4294967295 ^ mi) ))
-  # inv debe ser 000..0111..1 => inv & (inv+1) == 0
+  inv=$(( 4294967295 ^ mi ))
   (( (inv & (inv + 1)) == 0 )) || return 1
   return 0
 }
@@ -50,6 +59,23 @@ same_subnet() {
   (( (i1 & m) == (i2 & m) ))
 }
 
+net_addr() {
+  local ip="$1" mask="$2"
+  local i m
+  i=$(ip_to_int "$ip") || return 1
+  m=$(ip_to_int "$mask") || return 1
+  int_to_ip $(( i & m ))
+}
+
+broadcast_addr() {
+  local ip="$1" mask="$2"
+  local i m inv
+  i=$(ip_to_int "$ip") || return 1
+  m=$(ip_to_int "$mask") || return 1
+  inv=$(( 4294967295 ^ m ))
+  int_to_ip $(( (i & m) | inv ))
+}
+
 read_ipv4() {
   local prompt="$1" def="${2:-}" v
   while true; do
@@ -60,7 +86,7 @@ read_ipv4() {
       read -r -p "$prompt: " v
     fi
     if is_ipv4 "$v"; then echo "$v"; return 0; fi
-    echo "IP inválida. Ejemplo valido: 192.168.100.10 (no 1000, no 0.0.0.0)."
+    echo "IP invalida. Ej: 103.5.153.9 (no 0.0.0.0 / 255.255.255.255)."
   done
 }
 
@@ -75,21 +101,18 @@ read_ipv4_optional() {
       read -r -p "$prompt (ENTER o -=omitir): " v
       [[ -z "$v" || "$v" == "-" ]] && echo "" && return 0
     fi
-
     if is_ipv4 "$v"; then echo "$v"; return 0; fi
-    echo "IP inválida. Ejemplo: 192.168.100.1"
+    echo "IP invalida. Ej: 8.8.8.8"
   done
 }
 
-
 read_mask() {
-  local prompt="$1" def="${2:-}"
-  local v
+  local prompt="$1" def="${2:-}" v
   while true; do
     read -r -p "$prompt [$def]: " v
     v="${v:-$def}"
     if mask_is_valid "$v"; then echo "$v"; return 0; fi
-    echo "Máscara inválida. Ejemplo: 255.255.255.0"
+    echo "Mascara invalida. Ej: 255.255.255.0"
   done
 }
 
@@ -100,7 +123,7 @@ pick_leases_file() {
 }
 
 ensure_root() {
-  [[ ${EUID:-999} -eq 0 ]] || die "Ejecuta como root: sudo bash main.sh"
+  [[ ${EUID:-999} -eq 0 ]] || die "Ejecuta como root: sudo ./dhcp_script.sh"
 }
 
 pkg_install() {
@@ -108,12 +131,11 @@ pkg_install() {
     echo "dhcp-server ya esta instalado."
     return 0
   fi
-
   echo "Instalando dhcp-server (Mageia)..."
   if command -v dnf >/dev/null 2>&1; then
-    dnf -y install dhcp-server || die "Falló dnf install dhcp-server"
+    dnf -y install dhcp-server || die "Fallo dnf install dhcp-server"
   elif command -v urpmi >/dev/null 2>&1; then
-    urpmi --auto dhcp-server || die "Falló urpmi dhcp-server"
+    urpmi --auto dhcp-server || die "Fallo urpmi dhcp-server"
   else
     die "No encontre dnf ni urpmi. Instala dhcp-server manualmente."
   fi
@@ -128,7 +150,7 @@ svc_status() {
   echo "== Servicio dhcpd =="
   systemctl --no-pager -l status dhcpd || true
   echo
-  echo "== Últimos logs (dhcpd) =="
+  echo "== Ultimos logs (dhcpd) =="
   journalctl -u dhcpd -n 40 --no-pager || true
 }
 
@@ -152,47 +174,107 @@ leases_active() {
   ' "$lf" | sort -V
 }
 
+set_server_static_ip() {
+  local iface="$1" ip="$2" mask="$3"
+  # calcula prefijo desde mascara
+  local m bits=0 i
+  m=$(ip_to_int "$mask") || return 1
+  for ((i=31;i>=0;i--)); do
+    (( (m>>i)&1 )) && ((bits++))
+  done
+
+  echo "Asignando IP estatica al servidor: $ip/$bits en $iface"
+  # runtime (sin depender de NetworkManager)
+  ip addr flush dev "$iface" >/dev/null 2>&1 || true
+  ip addr add "$ip/$bits" dev "$iface" || die "No pude asignar IP al iface $iface"
+  ip link set "$iface" up || true
+
+  # persistencia en distros tipo Mageia/RHEL (si existen ifcfg)
+  if [[ -d /etc/sysconfig/network-scripts ]]; then
+    cat >"/etc/sysconfig/network-scripts/ifcfg-${iface}" <<EOF
+DEVICE=${iface}
+BOOTPROTO=static
+ONBOOT=yes
+IPADDR=${ip}
+NETMASK=${mask}
+EOF
+  fi
+}
+
 configure_dhcp() {
-  local scopeName start end mask gw dns iface leaseDays leaseSec segNet
-  scopeName=""
-  read -r -p "Nombre descriptivo del ambito [Scope-Sistemas]: " scopeName
-  scopeName="${scopeName:-Scope-Sistemas}"
+  local scopeName srv_ip end mask gw dns1 dns2 iface leaseSec net bc pool_start
+  read -r -p "Nombre descriptivo del ambito [Scope-1]: " scopeName
+  scopeName="${scopeName:-Scope-1}"
 
-  start=$(read_ipv4 "Rango inicial" "192.168.100.50")
-  end=$(read_ipv4 "Rango final" "192.168.100.150")
-  mask=$(read_mask "Mascara (debe ser /24 para esta práctica)" "$SEG_MASK")
+  echo
+  echo "Captura asi:"
+  echo " - La PRIMERA IP se reserva y se pone ESTATICA al servidor."
+  echo " - El DHCP empezara a dar desde la SIGUIENTE IP (start+1)."
+  echo
 
-  # Validación: start/end dentro del segmento 192.168.100.0/24 y orden correcto
-  segNet="$SEG_NET"
-  if ! same_subnet "$start" "$segNet" "$mask"; then
-    die "El rango inicial $start NO pertenece a $segNet/$mask"
-  fi
-  if ! same_subnet "$end" "$segNet" "$mask"; then
-    die "El rango final $end NO pertenece a $segNet/$mask"
-  fi
+  srv_ip=$(read_ipv4 "IP inicial (reservada para el servidor)" "103.5.153.9")
+  end=$(read_ipv4 "IP final (ultima para clientes)" "103.5.153.115")
+  mask=$(read_mask "Mascara" "255.255.255.0")
 
+  # Validaciones de subred y orden
+  same_subnet "$srv_ip" "$end" "$mask" || die "srv_ip y end NO estan en la misma subred segun $mask"
   local si ei
-  si=$(ip_to_int "$start"); ei=$(ip_to_int "$end")
-  (( si <= ei )) || die "El rango inicial debe ser <= rango final"
+  si=$(ip_to_int "$srv_ip"); ei=$(ip_to_int "$end")
+  (( si < ei )) || die "La IP inicial (server) debe ser MENOR a la final."
 
-  gw=$(read_ipv4 "Gateway (Router) en la misma subred" "192.168.100.1")
-  same_subnet "$gw" "$segNet" "$mask" || die "Gateway $gw NO pertenece a $segNet/$mask"
+  pool_start=$(ip_add "$srv_ip" 1) || die "No pude calcular start+1"
+  local pi
+  pi=$(ip_to_int "$pool_start")
+  (( pi <= ei )) || die "No hay espacio: start+1 ($pool_start) se pasa del final ($end)"
 
-  dns=$(read_ipv4 "DNS (IPv4)" "192.168.100.20")
+  gw=$(read_ipv4_optional "PE / Puerta de enlace (opcional)" "")
+  if [[ -n "$gw" ]]; then
+    same_subnet "$gw" "$srv_ip" "$mask" || die "Gateway $gw NO pertenece a la subred del server"
+  fi
 
-  read -r -p "Lease Time en dias [8]: " leaseDays
-  leaseDays="${leaseDays:-8}"
-  [[ "$leaseDays" =~ ^[0-9]+$ ]] || die "Lease days debe ser numero entero."
-  leaseSec=$(( leaseDays * 86400 ))
+  dns1=$(read_ipv4_optional "DNS Primario (opcional)" "")
+  if [[ -n "$dns1" ]]; then
+    same_subnet "$dns1" "$srv_ip" "$mask" || true # DNS puede estar fuera; no lo forzamos
+  fi
+  dns2=$(read_ipv4_optional "DNS Secundario (opcional)" "")
+  # dns2 puede estar fuera; no forzamos
 
+  read -r -p "Lease Time en segundos [500]: " leaseSec
+  leaseSec="${leaseSec:-500}"
+  [[ "$leaseSec" =~ ^[0-9]+$ ]] || die "Lease seconds debe ser entero."
+  (( leaseSec >= 60 && leaseSec <= 604800 )) || die "Lease seconds fuera de rango razonable (60..604800)."
+
+  echo
   echo "Interfaces disponibles:"
   ip -o link show | awk -F': ' '{print " - " $2}' | sed 's/@.*//' | grep -v '^ - lo$' || true
-  read -r -p "Interfaz donde escuchara DHCP (la de la red interna) [eth0]: " iface
+  read -r -p "Interfaz de la red interna [eth0]: " iface
   iface="${iface:-eth0}"
 
-  # Backup
+  net=$(net_addr "$srv_ip" "$mask") || die "No pude calcular network"
+  bc=$(broadcast_addr "$srv_ip" "$mask") || die "No pude calcular broadcast"
+
+  # Poner IP estatica al servidor (requisito)
+  set_server_static_ip "$iface" "$srv_ip" "$mask"
+
+  # Backup config
   if [[ -f "$CONF" ]]; then
     cp -a "$CONF" "${CONF}.bak.$(date +%F_%H%M%S)" || true
+  fi
+
+  # Construir opciones DHCP segun lo que si se capturo
+  local opt_routers="" opt_dns=""
+  if [[ -n "$gw" ]]; then
+    opt_routers="option routers ${gw};"
+  fi
+
+  if [[ -n "$dns1" && -n "$dns2" ]]; then
+    opt_dns="option domain-name-servers ${dns1}, ${dns2};"
+  elif [[ -n "$dns1" ]]; then
+    opt_dns="option domain-name-servers ${dns1};"
+  elif [[ -n "$dns2" ]]; then
+    opt_dns="option domain-name-servers ${dns2};"
+  else
+    opt_dns=""  # ninguno
   fi
 
   cat >"$CONF" <<EOF
@@ -203,12 +285,12 @@ default-lease-time ${leaseSec};
 max-lease-time ${leaseSec};
 
 option subnet-mask ${mask};
-option broadcast-address 192.168.100.255;
-option routers ${gw};
-option domain-name-servers ${dns};
+option broadcast-address ${bc};
+${opt_routers}
+${opt_dns}
 
-subnet 192.168.100.0 netmask ${mask} {
-  range ${start} ${end};
+subnet ${net} netmask ${mask} {
+  range ${pool_start} ${end};
 }
 EOF
 
@@ -218,7 +300,7 @@ EOF
   mkdir -p "$(dirname "$lf")" || true
   touch "$lf" || true
 
-  # Intento de limitar interfaz (comun en distros tipo RHEL/Mageia)
+  # Limitar interfaz (comun en RHEL/Mageia)
   mkdir -p /etc/sysconfig || true
   cat >/etc/sysconfig/dhcpd <<EOF
 DHCPD_INTERFACE="${iface}"
@@ -228,7 +310,6 @@ EOF
   echo "Validando sintaxis..."
   dhcpd -t -cf "$CONF" || die "Error en la configuracion. Corrige $CONF"
 
-  # Firewall si existe firewalld
   if command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --permanent --add-service=dhcp >/dev/null 2>&1 || true
     firewall-cmd --reload >/dev/null 2>&1 || true
@@ -237,16 +318,24 @@ EOF
   echo "Reiniciando dhcpd..."
   svc_restart
 
-  echo "Listo. Config aplicada en $CONF"
+  echo
+  echo "Listo:"
+  echo " - Server (IP estatica): ${srv_ip}"
+  echo " - Network: ${net} / ${mask}"
+  echo " - Pool: ${pool_start}  ->  ${end}"
+  echo " - Lease: ${leaseSec}s"
+  [[ -n "$gw" ]] && echo " - Gateway: ${gw}" || echo " - Gateway: (omitido)"
+  [[ -n "$opt_dns" ]] && echo " - DNS: ${dns1:-}${dns2:+, ${dns2}}" || echo " - DNS: (omitido)"
+  echo "Config en: $CONF"
 }
 
 menu() {
   while true; do
     echo
     echo "-------------Servidor DHCP --------------------"
-    echo "1) Instalar / Verificar INSTALACION"
-    echo "2) Configuracion DHCP"
-    echo "3) Monitoreo"
+    echo "1) Verificar / Instalar dhcp-server"
+    echo "2) Configurar DHCP (reservar 1a IP al server)"
+    echo "3) Monitoreo (status + leases)"
     echo "4) Restart Servicio"
     echo "5) Salir"
     read -r -p "Opcion: " op
