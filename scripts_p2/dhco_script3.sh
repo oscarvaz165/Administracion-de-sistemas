@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 # =========================
 #  DNS PRO (MAGEIA / BIND)
@@ -63,7 +63,6 @@ obtener_datos_red() {
 
 # --- Asegurar include en named.conf ---
 asegurar_include_named_conf() {
-  # Creamos include si no existe. (No reescribimos todo /etc/named.conf)
   if [ ! -f "$NAMED_CONF" ]; then
     echo "[ERROR] No existe $NAMED_CONF. ¿Está instalado BIND?" >&2
     exit 1
@@ -77,7 +76,6 @@ asegurar_include_named_conf() {
 
 # --- Reconstruir archivo de zonas administradas ---
 actualizar_zonas_conf() {
-  # Reescribe el archivo de zonas gestionadas con TODO lo que exista en pro-zones
   : > "$MANAGED_ZONES_CONF"
 
   shopt -s nullglob
@@ -99,20 +97,17 @@ EOF
 
 # --- Validar + recargar named ---
 aplicar_y_recargar() {
-  # Permisos típicos para que named lea zonas
   chown -R named:named "$ZONES_DIR" 2>/dev/null || true
   chmod 750 "$ZONES_DIR" 2>/dev/null || true
   chmod 640 "$ZONES_DIR"/db.* 2>/dev/null || true
   chmod 640 "$MANAGED_ZONES_CONF" 2>/dev/null || true
 
-  # Validar config
   if ! named-checkconf "$NAMED_CONF" >/dev/null 2>&1; then
     echo "[ERROR] named-checkconf falló. Revisa $NAMED_CONF y $MANAGED_ZONES_CONF" >&2
     named-checkconf "$NAMED_CONF" || true
     return 1
   fi
 
-  # Recargar servicio
   systemctl reload named >/dev/null 2>&1 || systemctl restart named >/dev/null 2>&1
 
   echo -e "\n[+] Configuración aplicada y named recargado."
@@ -126,6 +121,25 @@ serial_hoy() {
 
 crear_zona() {
   obtener_datos_red || return 1
+
+  echo
+  echo "¿Qué IP deseas usar para el dominio?"
+  echo "  1) Usar IP detectada: $IP_SUGERIDA"
+  echo "  2) Ingresar IP manualmente"
+  read -r -p "Opción (1/2): " opcion_ip
+
+  if [ "${opcion_ip}" = "2" ]; then
+    read -r -p "Introduce la IP: " IP_MANUAL
+    IP_MANUAL="${IP_MANUAL// /}"
+    if [ -z "$IP_MANUAL" ]; then
+      echo "[ERROR] IP vacía." >&2
+      return 1
+    fi
+    IP_SUGERIDA="$IP_MANUAL"
+  fi
+
+  echo "[+] IP a usar: $IP_SUGERIDA"
+
   read -r -p "Nombre del dominio (ej. reprobados.com): " dominio
   dominio="${dominio// /}"
 
@@ -136,7 +150,6 @@ crear_zona() {
 
   local zonefile="$ZONES_DIR/db.$dominio"
 
-  # Crear archivo de zona con IP detectada
   cat > "$zonefile" <<EOF
 \$TTL 86400
 @   IN  SOA ns1.$dominio. root.$dominio. (
@@ -152,7 +165,6 @@ ns1  IN  A   $IP_SUGERIDA
 www  IN  A   $IP_SUGERIDA
 EOF
 
-  # Validar zona
   if ! named-checkzone "$dominio" "$zonefile" >/dev/null 2>&1; then
     echo "[ERROR] named-checkzone falló para $dominio" >&2
     named-checkzone "$dominio" "$zonefile" || true
@@ -205,10 +217,10 @@ probar_resolucion() {
 
   echo
   if cmd_exists dig; then
-    echo "[dig] @$IP_LOCAL (127.0.0.1) -> A $dom_con"
+    echo "[dig] @127.0.0.1 -> A $dom_con"
     dig @"127.0.0.1" +short A "$dom_con" || true
     echo
-    echo "[dig] @$IP_LOCAL (127.0.0.1) -> A www.$dom_con"
+    echo "[dig] @127.0.0.1 -> A www.$dom_con"
     dig @"127.0.0.1" +short A "www.$dom_con" || true
   else
     echo "[i] 'dig' no está. Probando con nslookup..."
