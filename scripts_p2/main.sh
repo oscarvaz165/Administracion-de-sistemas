@@ -1,43 +1,43 @@
 #!/bin/bash
-set -e
 
-# Cargar las funciones de SSH, DNS, y DHCP
-source ./funciones_ssh.sh
-source ./funciones_dns.sh
-source ./funciones_dhcp.sh
+# ------------------------------------------
+#             MAGEIA SERVER
+# ------------------------------------------
 
-# Validar que se esté ejecutando como root
-require_root() {
-  if [[ $EUID -ne 0 ]]; then
-    echo "[ERROR] Ejecuta este script como root." >&2
-    exit 1
-  fi
-}
+# Carga de funciones modulares
+source ./funciones_mageia.sh
 
-# Menú Principal
+# Verificacion de privilegios
+if [ "$EUID" -ne 0 ]; then
+  echo -e "\e[1;31m[ERROR] Por favor, ejecuta este script como root o usando sudo.\e[0m"
+  exit 1
+fi
+
+# Inicializar y crear carpetas requeridas antes de menu
+inicializar_carpetas
+
 menu_principal() {
-  while true; do
-    clear
-    echo "==========================="
-    echo " SISTEMA DE ADMINISTRACIÓN"
-    echo "==========================="
-    echo "1) SSH"
-    echo "2) DNS"
-    echo "3) DHCP"
-    echo "4) Salir"
-    echo "==========================="
-    read -r -p "Seleccione una opción: " opcion
+    while true; do
+        clear
+        echo -e "\e[1;34m*********************************************\e[0m"
+        echo -e "\e[1;32m      MAGEIA SERVER - GESTOR DE SERVICIOS    \e[0m"
+        echo -e "\e[1;34m*********************************************\e[0m"
+        echo -e "\e[1;36m  [ 1 ] - Instalacion y Config. de SSH\e[0m"
+        echo -e "\e[1;36m  [ 2 ] - Administracion DHCP (ISC)\e[0m"
+        echo -e "\e[1;36m  [ 3 ] - Administracion DNS (BIND)\e[0m"
+        echo -e "\e[1;31m  [ 0 ] - Salir del Sistema\e[0m"
+        echo -e "\e[1;34m*********************************************\e[0m"
+        read -p ">> Indique la accion a realizar: " opcion
 
-    case "$opcion" in
-      1) menu_ssh ;;
-      2) menu_dns ;;
-      3) menu_dhcp ;;
-      4) echo "Saliendo..."; exit 0 ;;
-      *) echo "Opción no válida"; sleep 1 ;;
-    esac
-  done
+        case $opcion in
+            1) modulo_ssh ;;
+            2) modulo_dhcp ;;
+            3) modulo_dns ;;
+            0) echo "Terminando programa..."; exit 0 ;;
+            *) echo -e "\e[1;31m[ERROR] - Opcion no valida.\e[0m"; sleep 2 ;;
+        esac
+    done
 }
 
-# Ejecutar la validación y el menú
-require_root
+# Llamada a arranque principal
 menu_principal
