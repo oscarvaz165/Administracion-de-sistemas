@@ -37,15 +37,11 @@ set_permiso_restringido() {
     local usuario="$2"
     local grupo="$3"
 
-    # Propietario root, grupo del usuario
     chown root:"$grupo" "$path"
-
-    # 3775 = setgid + sticky: 
+    # 3775 = setgid + sticky
     # - setgid: archivos nuevos heredan el grupo
     # - sticky: solo el dueño puede borrar/renombrar sus propios archivos
     chmod 3775 "$path"
-
-    # Aplicar sticky bit recursivamente a subdirectorios
     find "$path" -type d -exec chmod +t {} \; 2>/dev/null
 }
 
@@ -58,6 +54,23 @@ set_permiso_personal() {
 
     chown "$usuario":"$GRP_BASE" "$path"
     chmod 700 "$path"
+}
+
+# ================================================================
+# DETECTAR IP CORRECTA (ignora NAT 10.0.2.x)
+# ================================================================
+obtener_ip_local() {
+    # Primero intenta encontrar IP 192.168.x.x
+    IP=$(hostname -I | tr ' ' '\n' | grep "^192\.168\." | head -1)
+    # Si no encuentra, intenta 10.x.x.x que no sea 10.0.2.x (NAT de VirtualBox)
+    if [[ -z "$IP" ]]; then
+        IP=$(hostname -I | tr ' ' '\n' | grep "^10\." | grep -v "^10\.0\.2\." | head -1)
+    fi
+    # Si aun no encuentra, toma la primera IP disponible que no sea loopback
+    if [[ -z "$IP" ]]; then
+        IP=$(hostname -I | tr ' ' '\n' | grep -v "^127\." | head -1)
+    fi
+    echo "$IP"
 }
 
 # ================================================================
@@ -77,7 +90,6 @@ inicializar_sistema() {
         aviso "vsftpd ya se encuentra en el sistema."
     fi
 
-    # Configurar shell seguro
     if ! grep -q "/sbin/nologin" /etc/shells; then
         echo "/sbin/nologin" >> /etc/shells
         info "Shell /sbin/nologin habilitado."
@@ -90,35 +102,34 @@ inicializar_sistema() {
 preparar_entorno_ftp() {
     info "Generando estructura de directorios en $RAIZ_FTP..."
 
-    # Creación de grupos si no existen
     for g in "$GRP_A" "$GRP_B" "$GRP_BASE"; do
         groupadd -f "$g"
     done
 
-    # Creación de carpetas base
     mkdir -p "$RAIZ_FTP/publica" \
              "$DIR_GRUPOS/$GRP_A" \
              "$DIR_GRUPOS/$GRP_B" \
              "$DIR_PERSONAL" \
              "$DIR_HOME_USUARIOS"
 
-    # Carpeta anonima: propiedad root, sin escritura, SIN contenido visible
+    # Carpeta anonima: vacia, solo lectura, sin montajes
+    umount -l "$DIR_ANONIMO" 2>/dev/null
+    rm -rf "$DIR_ANONIMO"
     mkdir -p "$DIR_ANONIMO"
-    chown root:root "$DIR_ANONIMO"
-    chmod 555 "$DIR_ANONIMO"   # Solo lectura, sin escritura para nadie
+    chown ftp:ftp "$DIR_ANONIMO"
+    chmod 555 "$DIR_ANONIMO"
 
     # Carpeta publica con sticky bit
     chown root:"$GRP_BASE" "$RAIZ_FTP/publica"
     chmod 3775 "$RAIZ_FTP/publica"
 
-    # Permisos para grupos especificos con sticky + setgid
+    # Carpetas de grupo con sticky + setgid
     chown root:"$GRP_A" "$DIR_GRUPOS/$GRP_A"
     chmod 3775 "$DIR_GRUPOS/$GRP_A"
 
     chown root:"$GRP_B" "$DIR_GRUPOS/$GRP_B"
     chmod 3775 "$DIR_GRUPOS/$GRP_B"
 
-    # Apertura de puertos
     info "Configurando excepciones en el cortafuegos..."
     if hash firewall-cmd 2>/dev/null; then
         firewall-cmd --permanent --add-service=ftp
@@ -135,12 +146,12 @@ preparar_entorno_ftp() {
 # 3. Aplicar Parámetros de vsftpd
 # ================================================================
 desplegar_configuracion() {
-    IP_LOCAL=$(hostname -I | cut -f1 -d' ')
+    IP_LOCAL=$(obtener_ip_local)
     info "Generando archivo maestro: /etc/vsftpd.conf ($IP_LOCAL)..."
 
     mkdir -p /usr/share/empty ; chmod 555 /usr/share/empty
 
-    # Crear lista de usuarios que NO pueden entrar (bloquear ftp y root)
+    # Lista de usuarios bloqueados
     echo "root" > /etc/vsftpd.user_list
     echo "ftp"  >> /etc/vsftpd.user_list
 
@@ -150,7 +161,6 @@ listen=YES
 listen_ipv6=NO
 
 # --- SEGMENTO ANONIMO ---
-# Anonymous entra pero ve carpeta vacia (sin contenido)
 anonymous_enable=YES
 no_anon_password=YES
 anon_root=$DIR_ANONIMO
@@ -188,13 +198,14 @@ xferlog_enable=YES
 dirmessage_enable=YES
 use_localtime=YES
 connect_from_port_20=YES
-secure_chroot_dir=/usr/share/empty
+secure_chroot_dir=$DIR_ANONIMO
 CONF_MAESTRA
 
     [ -d "/etc/vsftpd" ] && cp /etc/vsftpd.conf /etc/vsftpd/vsftpd.conf
 
     systemctl restart vsftpd && systemctl enable vsftpd
     exito "El servicio FTP se ha reiniciado correctamente."
+    info  "IP del servidor FTP: $IP_LOCAL"
     info  "Anonymous: entra sin password, ve carpeta vacia."
     info  "Usuarios: entran con password, ven solo su home."
 }
@@ -221,7 +232,6 @@ registrar_usuarios_ftp() {
         perfil_seleccionado="$GRP_A"
         [[ "${perfil,,}" == "b" ]] && perfil_seleccionado="$GRP_B"
 
-        # Creación del usuario
         if ! getent passwd "$user_id" > /dev/null; then
             useradd -m -g "$GRP_BASE" -G "$perfil_seleccionado" -s /sbin/nologin "$user_id"
             echo "$user_id:$user_key" | chpasswd
@@ -232,7 +242,6 @@ registrar_usuarios_ftp() {
             echo "$user_id:$user_key" | chpasswd
         fi
 
-        # Directorio home virtual
         HOME_VIRTUAL="$DIR_HOME_USUARIOS/$user_id"
         mkdir -p "$HOME_VIRTUAL"/{publica,"$perfil_seleccionado",personal}
 
@@ -240,19 +249,19 @@ registrar_usuarios_ftp() {
         chown root:root "$HOME_VIRTUAL"
         chmod 755 "$HOME_VIRTUAL"
 
-        # Montar carpeta publica con permisos restringidos
+        # Carpeta publica
         if ! mountpoint -q "$HOME_VIRTUAL/publica" 2>/dev/null; then
             mount --bind "$RAIZ_FTP/publica" "$HOME_VIRTUAL/publica"
         fi
         set_permiso_restringido "$HOME_VIRTUAL/publica" "$user_id" "$GRP_BASE"
 
-        # Montar carpeta de grupo con permisos restringidos
+        # Carpeta de grupo
         if ! mountpoint -q "$HOME_VIRTUAL/$perfil_seleccionado" 2>/dev/null; then
             mount --bind "$DIR_GRUPOS/$perfil_seleccionado" "$HOME_VIRTUAL/$perfil_seleccionado"
         fi
         set_permiso_restringido "$HOME_VIRTUAL/$perfil_seleccionado" "$user_id" "$perfil_seleccionado"
 
-        # Carpeta personal: control total solo del dueño
+        # Carpeta personal
         mkdir -p "$DIR_PERSONAL/$user_id"
         set_permiso_personal "$DIR_PERSONAL/$user_id" "$user_id"
         if ! mountpoint -q "$HOME_VIRTUAL/personal" 2>/dev/null; then
@@ -389,9 +398,9 @@ validar_login() {
 opc_menu=0
 while [[ $opc_menu -ne 7 ]]; do
     clear
-    echo -e "\e[1;35m╔══════════════════════════════════════════════╗\e[0m"
-    echo -e "\e[1;35m║  CONSOLA DE CONTROL - SERVIDOR FTP (LINUX)   ║\e[0m"
-    echo -e "\e[1;35m╚══════════════════════════════════════════════╝\e[0m"
+    echo -e "\e[1;31m╔══════════════════════════════════════════════╗\e[0m"
+    echo -e "\e[1;31m║  CONSOLA DE CONTROL - SERVIDOR FTP (LINUX)   ║\e[0m"
+    echo -e "\e[1;31m╚══════════════════════════════════════════════╝\e[0m"
     echo "  1) Despliegue: Instalar y Configurar vsftpd"
     echo "  2) Usuarios: Registro Masivo de Cuentas"
     echo "  3) Auditoría: Ver Usuarios en Sistema"
