@@ -29,8 +29,8 @@ fi
 
 # ================================================================
 # FUNCION CENTRAL DE PERMISOS RESTRINGIDOS
-# El usuario puede: leer, crear y escribir archivos
-# NO puede: eliminar, renombrar carpetas del sistema
+# El usuario puede: leer y escribir archivos propios
+# NO puede: eliminar ni renombrar carpetas del sistema
 # ================================================================
 set_permiso_restringido() {
     local path="$1"
@@ -40,12 +40,12 @@ set_permiso_restringido() {
     # Propietario root, grupo del usuario
     chown root:"$grupo" "$path"
 
-    # rwxrwx--- : grupo puede leer/escribir/ejecutar pero NO sticky bit
-    # El sticky bit (+t) en directorios impide que usuarios borren/renombren
-    # archivos o carpetas que no les pertenecen
-    chmod 1775 "$path"
+    # 3775 = setgid + sticky: 
+    # - setgid: archivos nuevos heredan el grupo
+    # - sticky: solo el dueño puede borrar/renombrar sus propios archivos
+    chmod 3775 "$path"
 
-    # Aplicar sticky bit recursivamente para proteger subcarpetas
+    # Aplicar sticky bit recursivamente a subdirectorios
     find "$path" -type d -exec chmod +t {} \; 2>/dev/null
 }
 
@@ -57,7 +57,6 @@ set_permiso_personal() {
     local usuario="$2"
 
     chown "$usuario":"$GRP_BASE" "$path"
-    # 700 = solo el dueño tiene control total, nadie más entra
     chmod 700 "$path"
 }
 
@@ -97,36 +96,27 @@ preparar_entorno_ftp() {
     done
 
     # Creación de carpetas base
-    mkdir -p "$RAIZ_FTP/publica" "$DIR_GRUPOS/$GRP_A" "$DIR_GRUPOS/$GRP_B" "$DIR_PERSONAL" "$DIR_HOME_USUARIOS"
+    mkdir -p "$RAIZ_FTP/publica" \
+             "$DIR_GRUPOS/$GRP_A" \
+             "$DIR_GRUPOS/$GRP_B" \
+             "$DIR_PERSONAL" \
+             "$DIR_HOME_USUARIOS"
 
-    # Carpeta anónima y sus subdirectorios de espejo
-    mkdir -p "$DIR_ANONIMO"/{publica,"$GRP_A","$GRP_B"}
+    # Carpeta anonima: propiedad root, sin escritura, SIN contenido visible
+    mkdir -p "$DIR_ANONIMO"
+    chown root:root "$DIR_ANONIMO"
+    chmod 555 "$DIR_ANONIMO"   # Solo lectura, sin escritura para nadie
 
-    # Carpeta publica: sticky bit para que nadie borre lo ajeno
+    # Carpeta publica con sticky bit
     chown root:"$GRP_BASE" "$RAIZ_FTP/publica"
-    chmod 1777 "$RAIZ_FTP/publica"
+    chmod 3775 "$RAIZ_FTP/publica"
 
-    # Permisos para grupos específicos con sticky bit
+    # Permisos para grupos especificos con sticky + setgid
     chown root:"$GRP_A" "$DIR_GRUPOS/$GRP_A"
-    chmod 3775 "$DIR_GRUPOS/$GRP_A"   # setgid + sticky
+    chmod 3775 "$DIR_GRUPOS/$GRP_A"
 
     chown root:"$GRP_B" "$DIR_GRUPOS/$GRP_B"
-    chmod 3775 "$DIR_GRUPOS/$GRP_B"   # setgid + sticky
-
-    # Configuración de montajes en espejo (Solo Lectura para Anónimos)
-    configurar_montaje_ro() {
-        if ! mountpoint -q "$1" 2>/dev/null; then
-            mount --bind "$2" "$1"
-            mount -o remount,ro,bind "$1"
-        fi
-    }
-
-    configurar_montaje_ro "$DIR_ANONIMO/publica"  "$RAIZ_FTP/publica"
-    configurar_montaje_ro "$DIR_ANONIMO/$GRP_A"   "$DIR_GRUPOS/$GRP_A"
-    configurar_montaje_ro "$DIR_ANONIMO/$GRP_B"   "$DIR_GRUPOS/$GRP_B"
-
-    chown root:root "$DIR_ANONIMO"
-    chmod 555 "$DIR_ANONIMO"
+    chmod 3775 "$DIR_GRUPOS/$GRP_B"
 
     # Apertura de puertos
     info "Configurando excepciones en el cortafuegos..."
@@ -150,12 +140,17 @@ desplegar_configuracion() {
 
     mkdir -p /usr/share/empty ; chmod 555 /usr/share/empty
 
+    # Crear lista de usuarios que NO pueden entrar (bloquear ftp y root)
+    echo "root" > /etc/vsftpd.user_list
+    echo "ftp"  >> /etc/vsftpd.user_list
+
     cat > /etc/vsftpd.conf <<CONF_MAESTRA
-# CONFIGURACIÓN PERSONALIZADA VSFTPD
+# CONFIGURACION PERSONALIZADA VSFTPD
 listen=YES
 listen_ipv6=NO
 
-# --- SEGMENTO ANÓNIMO ---
+# --- SEGMENTO ANONIMO ---
+# Anonymous entra pero ve carpeta vacia (sin contenido)
 anonymous_enable=YES
 no_anon_password=YES
 anon_root=$DIR_ANONIMO
@@ -166,8 +161,8 @@ anon_other_write_enable=NO
 # --- SEGMENTO USUARIOS LOCALES ---
 local_enable=YES
 write_enable=YES
-local_umask=002
-file_open_mode=0775
+local_umask=022
+file_open_mode=0644
 
 # --- SEGURIDAD Y JAULAS (CHROOT) ---
 chroot_local_user=YES
@@ -175,7 +170,12 @@ allow_writeable_chroot=YES
 user_sub_token=\$USER
 local_root=$DIR_HOME_USUARIOS/\$USER
 
-# --- PARAMETROS DE SESIÓN ---
+# --- LISTA DE USUARIOS BLOQUEADOS ---
+userlist_enable=YES
+userlist_deny=YES
+userlist_file=/etc/vsftpd.user_list
+
+# --- PARAMETROS DE SESION ---
 pam_service_name=vsftpd
 check_shell=NO
 pasv_enable=YES
@@ -195,6 +195,8 @@ CONF_MAESTRA
 
     systemctl restart vsftpd && systemctl enable vsftpd
     exito "El servicio FTP se ha reiniciado correctamente."
+    info  "Anonymous: entra sin password, ve carpeta vacia."
+    info  "Usuarios: entran con password, ven solo su home."
 }
 
 # ================================================================
@@ -219,7 +221,7 @@ registrar_usuarios_ftp() {
         perfil_seleccionado="$GRP_A"
         [[ "${perfil,,}" == "b" ]] && perfil_seleccionado="$GRP_B"
 
-        # Creación técnica del usuario
+        # Creación del usuario
         if ! getent passwd "$user_id" > /dev/null; then
             useradd -m -g "$GRP_BASE" -G "$perfil_seleccionado" -s /sbin/nologin "$user_id"
             echo "$user_id:$user_key" | chpasswd
@@ -230,34 +232,38 @@ registrar_usuarios_ftp() {
             echo "$user_id:$user_key" | chpasswd
         fi
 
-        # Directorio home virtual del usuario
+        # Directorio home virtual
         HOME_VIRTUAL="$DIR_HOME_USUARIOS/$user_id"
         mkdir -p "$HOME_VIRTUAL"/{publica,"$perfil_seleccionado",personal}
 
-        # Root del home: propiedad root, no modificable por el usuario
+        # Root del home: propiedad root, el usuario NO puede modificarlo
         chown root:root "$HOME_VIRTUAL"
         chmod 755 "$HOME_VIRTUAL"
 
-        # Montar carpeta publica con sticky bit (no borrar lo ajeno)
-        mount --bind "$RAIZ_FTP/publica" "$HOME_VIRTUAL/publica"
+        # Montar carpeta publica con permisos restringidos
+        if ! mountpoint -q "$HOME_VIRTUAL/publica" 2>/dev/null; then
+            mount --bind "$RAIZ_FTP/publica" "$HOME_VIRTUAL/publica"
+        fi
         set_permiso_restringido "$HOME_VIRTUAL/publica" "$user_id" "$GRP_BASE"
 
-        # Montar carpeta de grupo con sticky bit
-        mount --bind "$DIR_GRUPOS/$perfil_seleccionado" "$HOME_VIRTUAL/$perfil_seleccionado"
+        # Montar carpeta de grupo con permisos restringidos
+        if ! mountpoint -q "$HOME_VIRTUAL/$perfil_seleccionado" 2>/dev/null; then
+            mount --bind "$DIR_GRUPOS/$perfil_seleccionado" "$HOME_VIRTUAL/$perfil_seleccionado"
+        fi
         set_permiso_restringido "$HOME_VIRTUAL/$perfil_seleccionado" "$user_id" "$perfil_seleccionado"
 
         # Carpeta personal: control total solo del dueño
         mkdir -p "$DIR_PERSONAL/$user_id"
         set_permiso_personal "$DIR_PERSONAL/$user_id" "$user_id"
-        mount --bind "$DIR_PERSONAL/$user_id" "$HOME_VIRTUAL/personal"
-
-        # La carpeta personal montada hereda permisos del dueño
+        if ! mountpoint -q "$HOME_VIRTUAL/personal" 2>/dev/null; then
+            mount --bind "$DIR_PERSONAL/$user_id" "$HOME_VIRTUAL/personal"
+        fi
         chown "$user_id":"$GRP_BASE" "$HOME_VIRTUAL/personal"
         chmod 700 "$HOME_VIRTUAL/personal"
 
         exito "Usuario '$user_id' listo. Home: $HOME_VIRTUAL"
         info  "Subcarpetas: publica, $perfil_seleccionado, personal"
-        info  "Permisos: puede leer/escribir archivos. NO puede borrar ni renombrar lo ajeno."
+        info  "Permisos: puede leer/escribir sus archivos. NO puede borrar ni renombrar lo ajeno."
     done
 }
 
@@ -294,7 +300,9 @@ migrar_usuario() {
     rmdir "$RAIZ_VIRTUAL/$previo" 2>/dev/null
 
     mkdir -p "$RAIZ_VIRTUAL/$nuevo"
-    mount --bind "$DIR_GRUPOS/$nuevo" "$RAIZ_VIRTUAL/$nuevo"
+    if ! mountpoint -q "$RAIZ_VIRTUAL/$nuevo" 2>/dev/null; then
+        mount --bind "$DIR_GRUPOS/$nuevo" "$RAIZ_VIRTUAL/$nuevo"
+    fi
     set_permiso_restringido "$RAIZ_VIRTUAL/$nuevo" "$target" "$nuevo"
 
     exito "El usuario $target ha sido migrado a $nuevo."
