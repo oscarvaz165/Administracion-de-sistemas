@@ -16,7 +16,7 @@ GRP_B="recursadores"
 GRP_BASE="ftp_users"
 
 # --- Funciones de Utilidad y Estética ---
-info() { echo -e "\e[34m[INFO]\e[0m $1"; }
+info()  { echo -e "\e[34m[INFO]\e[0m $1"; }
 exito() { echo -e "\e[32m[OK]\e[0m $1"; }
 error() { echo -e "\e[31m[ERROR]\e[0m $1"; }
 aviso() { echo -e "\e[33m[AVISO]\e[0m $1"; }
@@ -27,7 +27,43 @@ if [[ $(id -u) -ne 0 ]]; then
     exit 1
 fi
 
+# ================================================================
+# FUNCION CENTRAL DE PERMISOS RESTRINGIDOS
+# El usuario puede: leer, crear y escribir archivos
+# NO puede: eliminar, renombrar carpetas del sistema
+# ================================================================
+set_permiso_restringido() {
+    local path="$1"
+    local usuario="$2"
+    local grupo="$3"
+
+    # Propietario root, grupo del usuario
+    chown root:"$grupo" "$path"
+
+    # rwxrwx--- : grupo puede leer/escribir/ejecutar pero NO sticky bit
+    # El sticky bit (+t) en directorios impide que usuarios borren/renombren
+    # archivos o carpetas que no les pertenecen
+    chmod 1775 "$path"
+
+    # Aplicar sticky bit recursivamente para proteger subcarpetas
+    find "$path" -type d -exec chmod +t {} \; 2>/dev/null
+}
+
+# ================================================================
+# FUNCION PARA CARPETA PERSONAL (control total del dueño)
+# ================================================================
+set_permiso_personal() {
+    local path="$1"
+    local usuario="$2"
+
+    chown "$usuario":"$GRP_BASE" "$path"
+    # 700 = solo el dueño tiene control total, nadie más entra
+    chmod 700 "$path"
+}
+
+# ================================================================
 # 1. Preparación del Sistema y Binarios
+# ================================================================
 inicializar_sistema() {
     info "Validando presencia de vsftpd..."
     if ! rpm -qa | grep -q vsftpd; then
@@ -49,7 +85,9 @@ inicializar_sistema() {
     fi
 }
 
+# ================================================================
 # 2. Configuración de Almacenamiento y Jerarquías
+# ================================================================
 preparar_entorno_ftp() {
     info "Generando estructura de directorios en $RAIZ_FTP..."
 
@@ -60,20 +98,20 @@ preparar_entorno_ftp() {
 
     # Creación de carpetas base
     mkdir -p "$RAIZ_FTP/publica" "$DIR_GRUPOS/$GRP_A" "$DIR_GRUPOS/$GRP_B" "$DIR_PERSONAL" "$DIR_HOME_USUARIOS"
-    
+
     # Carpeta anónima y sus subdirectorios de espejo
     mkdir -p "$DIR_ANONIMO"/{publica,"$GRP_A","$GRP_B"}
 
-    # Ajuste de permisos iniciales
+    # Carpeta publica: sticky bit para que nadie borre lo ajeno
     chown root:"$GRP_BASE" "$RAIZ_FTP/publica"
-    chmod 777 "$RAIZ_FTP/publica"
+    chmod 1777 "$RAIZ_FTP/publica"
 
-    # Permisos para grupos específicos
+    # Permisos para grupos específicos con sticky bit
     chown root:"$GRP_A" "$DIR_GRUPOS/$GRP_A"
-    chmod 2775 "$DIR_GRUPOS/$GRP_A"
+    chmod 3775 "$DIR_GRUPOS/$GRP_A"   # setgid + sticky
 
     chown root:"$GRP_B" "$DIR_GRUPOS/$GRP_B"
-    chmod 2775 "$DIR_GRUPOS/$GRP_B"
+    chmod 3775 "$DIR_GRUPOS/$GRP_B"   # setgid + sticky
 
     # Configuración de montajes en espejo (Solo Lectura para Anónimos)
     configurar_montaje_ro() {
@@ -83,9 +121,9 @@ preparar_entorno_ftp() {
         fi
     }
 
-    configurar_montaje_ro "$DIR_ANONIMO/publica" "$RAIZ_FTP/publica"
-    configurar_montaje_ro "$DIR_ANONIMO/$GRP_A" "$DIR_GRUPOS/$GRP_A"
-    configurar_montaje_ro "$DIR_ANONIMO/$GRP_B" "$DIR_GRUPOS/$GRP_B"
+    configurar_montaje_ro "$DIR_ANONIMO/publica"  "$RAIZ_FTP/publica"
+    configurar_montaje_ro "$DIR_ANONIMO/$GRP_A"   "$DIR_GRUPOS/$GRP_A"
+    configurar_montaje_ro "$DIR_ANONIMO/$GRP_B"   "$DIR_GRUPOS/$GRP_B"
 
     chown root:root "$DIR_ANONIMO"
     chmod 555 "$DIR_ANONIMO"
@@ -103,11 +141,13 @@ preparar_entorno_ftp() {
     exito "Infraestructura de red y archivos lista."
 }
 
+# ================================================================
 # 3. Aplicar Parámetros de vsftpd
+# ================================================================
 desplegar_configuracion() {
     IP_LOCAL=$(hostname -I | cut -f1 -d' ')
     info "Generando archivo maestro: /etc/vsftpd.conf ($IP_LOCAL)..."
-    
+
     mkdir -p /usr/share/empty ; chmod 555 /usr/share/empty
 
     cat > /etc/vsftpd.conf <<CONF_MAESTRA
@@ -151,25 +191,26 @@ connect_from_port_20=YES
 secure_chroot_dir=/usr/share/empty
 CONF_MAESTRA
 
-    # Sincronizar espejo si existe carpeta /etc/vsftpd/
     [ -d "/etc/vsftpd" ] && cp /etc/vsftpd.conf /etc/vsftpd/vsftpd.conf
 
     systemctl restart vsftpd && systemctl enable vsftpd
     exito "El servicio FTP se ha reiniciado correctamente."
 }
 
+# ================================================================
 # 4. Inserción de Nuevos Integrantes
+# ================================================================
 registrar_usuarios_ftp() {
     echo -n "Ingrese la cantidad de usuarios a dar de alta: "
     read total
-    
-    for (( c=1; c<=$total; c++ )); do
+
+    for (( c=1; c<=total; c++ )); do
         echo "-----------------------------------"
         echo -n "[$c/$total] Alias del usuario: "
         read user_id
         echo -n "Contraseña para $user_id: "
         read -s user_key ; echo ""
-        
+
         echo "Seleccione perfil de acceso:"
         echo "  A) $GRP_A"
         echo "  B) $GRP_B"
@@ -184,36 +225,49 @@ registrar_usuarios_ftp() {
             echo "$user_id:$user_key" | chpasswd
             exito "Cuenta $user_id creada."
         else
-            aviso "El usuario $user_id ya existe en Linux. Actualizando perfil..."
+            aviso "El usuario $user_id ya existe. Actualizando perfil..."
             usermod -a -G "$perfil_seleccionado" "$user_id"
             echo "$user_id:$user_key" | chpasswd
         fi
 
-        # Vínculos de Carpetas FTP
+        # Directorio home virtual del usuario
         HOME_VIRTUAL="$DIR_HOME_USUARIOS/$user_id"
         mkdir -p "$HOME_VIRTUAL"/{publica,"$perfil_seleccionado",personal}
+
+        # Root del home: propiedad root, no modificable por el usuario
         chown root:root "$HOME_VIRTUAL"
         chmod 755 "$HOME_VIRTUAL"
 
-        # Montajes bind para el usuario
+        # Montar carpeta publica con sticky bit (no borrar lo ajeno)
         mount --bind "$RAIZ_FTP/publica" "$HOME_VIRTUAL/publica"
+        set_permiso_restringido "$HOME_VIRTUAL/publica" "$user_id" "$GRP_BASE"
+
+        # Montar carpeta de grupo con sticky bit
         mount --bind "$DIR_GRUPOS/$perfil_seleccionado" "$HOME_VIRTUAL/$perfil_seleccionado"
-        
-        # Carpeta personal real y su vínculo
+        set_permiso_restringido "$HOME_VIRTUAL/$perfil_seleccionado" "$user_id" "$perfil_seleccionado"
+
+        # Carpeta personal: control total solo del dueño
         mkdir -p "$DIR_PERSONAL/$user_id"
-        chown "$user_id:$perfil_seleccionado" "$DIR_PERSONAL/$user_id"
-        chmod 700 "$DIR_PERSONAL/$user_id"
+        set_permiso_personal "$DIR_PERSONAL/$user_id" "$user_id"
         mount --bind "$DIR_PERSONAL/$user_id" "$HOME_VIRTUAL/personal"
 
-        exito "Asignación de recursos para $user_id: [publica, $perfil_seleccionado, personal]"
+        # La carpeta personal montada hereda permisos del dueño
+        chown "$user_id":"$GRP_BASE" "$HOME_VIRTUAL/personal"
+        chmod 700 "$HOME_VIRTUAL/personal"
+
+        exito "Usuario '$user_id' listo. Home: $HOME_VIRTUAL"
+        info  "Subcarpetas: publica, $perfil_seleccionado, personal"
+        info  "Permisos: puede leer/escribir archivos. NO puede borrar ni renombrar lo ajeno."
     done
 }
 
+# ================================================================
 # 5. Modificación de Perfil de Acceso
+# ================================================================
 migrar_usuario() {
     echo -n "Identificador del usuario a modificar: "
     read target
-    
+
     if ! getent passwd "$target" > /dev/null; then
         error "No se encontró el registro para '$target'."
         return
@@ -229,30 +283,30 @@ migrar_usuario() {
         nuevo="$GRP_B" ; previo="$GRP_A"
     fi
 
-    # Ajuste de grupos en sistema
     gpasswd -d "$target" "$previo" 2>/dev/null
     usermod -a -G "$nuevo" "$target"
 
     RAIZ_VIRTUAL="$DIR_HOME_USUARIOS/$target"
 
-    # Liberar memoria de punto viejo y remover rastro
     if mountpoint -q "$RAIZ_VIRTUAL/$previo" 2>/dev/null; then
         umount -l "$RAIZ_VIRTUAL/$previo"
     fi
     rmdir "$RAIZ_VIRTUAL/$previo" 2>/dev/null
 
-    # Establecer nuevo punto de acceso
     mkdir -p "$RAIZ_VIRTUAL/$nuevo"
     mount --bind "$DIR_GRUPOS/$nuevo" "$RAIZ_VIRTUAL/$nuevo"
+    set_permiso_restringido "$RAIZ_VIRTUAL/$nuevo" "$target" "$nuevo"
 
-    exito "El usuario $target ha sido migrado satisfactoriamente a $nuevo."
+    exito "El usuario $target ha sido migrado a $nuevo."
 }
 
+# ================================================================
 # 6. Remoción de Integrante
+# ================================================================
 baja_usuario() {
     echo -n "Nombre del usuario a dar de baja: "
     read alias_del
-    
+
     if ! id "$alias_del" &>/dev/null; then
         error "Usuario inexistente."
         return
@@ -261,12 +315,10 @@ baja_usuario() {
     aviso "Iniciando proceso de limpieza para $alias_del..."
     H_VIR="$DIR_HOME_USUARIOS/$alias_del"
 
-    # Desmontaje forzado de volúmenes vinculados
     for mnt in publica "$GRP_A" "$GRP_B" personal; do
         umount -l "$H_VIR/$mnt" 2>/dev/null
     done
 
-    # Eliminación de cuenta y datos físicos
     userdel -r "$alias_del" 2>/dev/null
     rm -rf "$H_VIR"
     rm -rf "$DIR_PERSONAL/$alias_del"
@@ -274,11 +326,13 @@ baja_usuario() {
     exito "El usuario $alias_del y sus datos han sido eliminados."
 }
 
+# ================================================================
 # 7. Auditoría de Usuarios
+# ================================================================
 visor_usuarios() {
     echo -e "\n\e[1;36m>> LISTADO DE CUENTAS POR PERFIL <<\e[0m"
     echo "=========================================="
-    
+
     hay_datos=0
     for g in "$GRP_A" "$GRP_B"; do
         lista=$(getent group "$g" | cut -d: -f4 | sed 's/,/  /g')
@@ -296,14 +350,15 @@ visor_usuarios() {
     read -p "Pulse [Enter] para retornar..."
 }
 
+# ================================================================
 # 8. Verificación de Inicio de Sesión
+# ================================================================
 validar_login() {
     echo -e "\n--- MONITOR DE ACCESO ---"
     echo -n "Ingrese su identificación: "
     read u_name
 
     if getent passwd "$u_name" > /dev/null; then
-        # Verificar si es parte de los grupos gestionados
         if ! groups "$u_name" | grep -qE "$GRP_A|$GRP_B"; then
             error "Acceso denegado: El usuario no tiene perfil FTP asignado."
             return
@@ -320,7 +375,9 @@ validar_login() {
     read -p "...Enter para continuar..."
 }
 
-# --- PANEL DE CONTROL PRINCIPAL ---
+# ================================================================
+#                   PANEL DE CONTROL PRINCIPAL
+# ================================================================
 opc_menu=0
 while [[ $opc_menu -ne 7 ]]; do
     clear
@@ -348,6 +405,6 @@ while [[ $opc_menu -ne 7 ]]; do
         7) exito "Cerrando consola de administración." ;;
         *) aviso "Opción fuera de rango." ; sleep 1 ;;
     esac
-    
-    [[ $opc_menu -ne 7 && $opc_menu -ne 3 && $opc_menu -ne 6 ]] && echo "" && read -p "Acción completada. Pulse Enter..." 
+
+    [[ $opc_menu -ne 7 && $opc_menu -ne 3 && $opc_menu -ne 6 ]] && echo "" && read -p "Acción completada. Pulse Enter..."
 done
