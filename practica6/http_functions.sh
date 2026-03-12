@@ -48,6 +48,7 @@ fn_validate_port() {
         fn_err "El puerto debe ser un numero entero."
         return 1
     fi
+
     if [ "$puerto" -lt 1 ] || [ "$puerto" -gt 65535 ]; then
         fn_err "Puerto $puerto fuera de rango valido (1-65535)."
         return 1
@@ -61,7 +62,7 @@ fn_validate_port() {
         fi
     done
 
-    if ss -tlnp 2>/dev/null | grep -q ":${puerto} "; then
+    if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "(^|:)$puerto$"; then
         fn_err "Puerto $puerto ya esta en uso."
         return 1
     fi
@@ -74,11 +75,11 @@ fn_solicitar_puerto() {
     local default="${2:-80}"
     local puerto
 
-    echo ""
-    echo "  Configuracion de puerto para: $servicio"
-    echo "  Sugeridos: 80, 8080, 8081, 8888"
-    echo "  Bloqueados: 22, 53, 443, 3306 (entre otros)"
-    echo ""
+    echo "" >&2
+    echo "  Configuracion de puerto para: $servicio" >&2
+    echo "  Sugeridos: 80, 8080, 8081, 8888" >&2
+    echo "  Bloqueados: 22, 53, 443, 3306 (entre otros)" >&2
+    echo "" >&2
 
     while true; do
         read -rp "  Puerto deseado [default: $default]: " puerto
@@ -88,7 +89,7 @@ fn_solicitar_puerto() {
         fi
     done
 
-    echo "$puerto"
+    printf '%s\n' "$puerto"
 }
 
 # ------------------------------------------------------------------------------
@@ -125,9 +126,9 @@ fn_install_pkg() {
     local paquete="$1"
     fn_info "Instalando $paquete..."
     if [ "$PKG_MANAGER" = "dnf" ]; then
-        dnf install -y "$paquete" 2>/dev/null
+        dnf install -y "$paquete"
     else
-        urpmi --auto "$paquete" 2>/dev/null
+        urpmi --auto "$paquete"
     fi
 }
 
@@ -216,6 +217,7 @@ fn_configurar_firewall() {
         if [ "$puerto_anterior" -gt 0 ] && [ "$puerto_anterior" -ne "$puerto" ]; then
             iptables -D INPUT -p tcp --dport "$puerto_anterior" -j ACCEPT 2>/dev/null || true
         fi
+        iptables -C INPUT -p tcp --dport "$puerto" -j ACCEPT 2>/dev/null || \
         iptables -A INPUT -p tcp --dport "$puerto" -j ACCEPT
         fn_ok "Puerto $puerto abierto en iptables."
     else
@@ -235,7 +237,7 @@ fn_crear_index() {
 
     mkdir -p "$webroot"
 
-    cat > "$webroot/index.html" << HTMLEOF
+    cat > "$webroot/index.html" <<HTMLEOF
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -266,6 +268,7 @@ fn_crear_index() {
 </body>
 </html>
 HTMLEOF
+
     fn_ok "index.html creado en $webroot"
 }
 
@@ -277,16 +280,16 @@ fn_get_puerto_actual() {
     local servicio="$1"
     case "$servicio" in
         apache|httpd)
-            grep -E '^Listen [0-9]+' /etc/httpd/conf/httpd.conf 2>/dev/null | \
+            grep -E '^Listen[[:space:]]+[0-9]+' /etc/httpd/conf/httpd.conf 2>/dev/null | \
                 awk '{print $2}' | head -1
             ;;
         nginx)
-            grep -E 'listen\s+[0-9]+' /etc/nginx/conf.d/practica6.conf 2>/dev/null | \
+            grep -E 'listen[[:space:]]+[0-9]+' /etc/nginx/conf.d/practica6.conf 2>/dev/null | \
                 grep -oE '[0-9]+' | head -1
             ;;
         tomcat)
             find /opt/tomcat /usr/share/tomcat /etc/tomcat -name server.xml 2>/dev/null | \
-                xargs grep -oE 'port="[0-9]+"' 2>/dev/null | head -1 | grep -oE '[0-9]+'
+                xargs grep -oE 'Connector port="[0-9]+"' 2>/dev/null | head -1 | grep -oE '[0-9]+'
             ;;
         *)
             echo "?"
@@ -310,27 +313,27 @@ fn_install_apache() {
     ver_real=$(httpd -v 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
     [ -z "$ver_real" ] && ver_real="desconocida"
 
-    # Puerto en httpd.conf
     local conf="/etc/httpd/conf/httpd.conf"
     if grep -qE '^Listen ' "$conf"; then
         sed -i "s/^Listen .*/Listen $puerto/" "$conf"
     else
         echo "Listen $puerto" >> "$conf"
     fi
-    sed -i "s/^#\?ServerName.*/ServerName localhost:$puerto/" "$conf" 2>/dev/null || \
+
+    if grep -qE '^#?ServerName' "$conf"; then
+        sed -i "s|^#\?ServerName.*|ServerName localhost:$puerto|" "$conf"
+    else
         echo "ServerName localhost:$puerto" >> "$conf"
+    fi
     fn_ok "Puerto $puerto configurado en httpd.conf."
 
-    # Seguridad
     fn_apache_security
     fn_apache_restrict_methods
 
-    # Usuario dedicado
     if ! id apache &>/dev/null; then
         useradd -r -s /sbin/nologin -d /var/www apache 2>/dev/null || true
     fi
 
-    # Webroot y permisos
     local webroot="/var/www/html"
     mkdir -p "$webroot"
     chown -R apache:apache "$webroot"
@@ -340,8 +343,13 @@ fn_install_apache() {
     fn_configurar_firewall "$puerto" 80
 
     systemctl enable httpd 2>/dev/null
-    systemctl restart httpd
-    fn_ok "Servicio httpd iniciado."
+    if httpd -t && systemctl restart httpd; then
+        fn_ok "Servicio httpd iniciado."
+    else
+        fn_err "Apache no pudo iniciar."
+        systemctl status httpd --no-pager -n 20
+        return 1
+    fi
 
     fn_section "Apache listo"
     echo -e "  ${GREEN}URL     : http://localhost:$puerto${NC}"
@@ -349,7 +357,7 @@ fn_install_apache() {
 }
 
 fn_apache_security() {
-    cat > "/etc/httpd/conf.d/security.conf" << 'EOF'
+    cat > "/etc/httpd/conf.d/security.conf" <<'EOF'
 # Seguridad Practica 6
 ServerTokens Prod
 ServerSignature Off
@@ -366,7 +374,7 @@ EOF
 }
 
 fn_apache_restrict_methods() {
-    cat > "/etc/httpd/conf.d/methods.conf" << 'EOF'
+    cat > "/etc/httpd/conf.d/methods.conf" <<'EOF'
 <Location />
     <LimitExcept GET POST HEAD OPTIONS>
         Require all denied
@@ -394,11 +402,10 @@ fn_install_nginx() {
     local webroot="/var/www/nginx"
     mkdir -p "$webroot"
 
-    # Deshabilitar default
     [ -f /etc/nginx/conf.d/default.conf ] && \
         mv /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/default.conf.bak 2>/dev/null || true
 
-    cat > "/etc/nginx/conf.d/practica6.conf" << NGINXEOF
+    cat > "/etc/nginx/conf.d/practica6.conf" <<NGINXEOF
 server {
     listen       $puerto;
     server_name  localhost;
@@ -419,17 +426,26 @@ server {
     location ~ /\. { deny all; }
 }
 NGINXEOF
-    fn_ok "nginx.conf generado con puerto $puerto."
+    fn_ok "Configuracion de Nginx generada con puerto $puerto."
 
-    chown -R nginx:nginx "$webroot"
+    if ! id nginx &>/dev/null; then
+        fn_warn "El usuario nginx no existe aun. Se instalaron los archivos, pero valida el paquete."
+    fi
+
+    chown -R nginx:nginx "$webroot" 2>/dev/null || true
     chmod 750 "$webroot"
 
     fn_crear_index "Nginx" "$ver_real" "$puerto" "$webroot"
     fn_configurar_firewall "$puerto" 80
 
     systemctl enable nginx 2>/dev/null
-    systemctl restart nginx
-    fn_ok "Servicio nginx iniciado."
+    if nginx -t && systemctl restart nginx; then
+        fn_ok "Servicio nginx iniciado."
+    else
+        fn_err "Nginx no pudo iniciar."
+        systemctl status nginx --no-pager -n 20
+        return 1
+    fi
 
     fn_section "Nginx listo"
     echo -e "  ${GREEN}URL     : http://localhost:$puerto${NC}"
@@ -445,24 +461,32 @@ fn_install_tomcat() {
 
     fn_section "Instalando Tomcat en Mageia 9"
     fn_update_repos
-
     fn_install_pkg "tomcat"
 
-    if systemctl list-units --type=service 2>/dev/null | grep -q tomcat; then
+    if systemctl list-unit-files 2>/dev/null | grep -q '^tomcat'; then
         fn_ok "Tomcat instalado desde repositorio."
         fn_tomcat_usuario
         fn_tomcat_puerto "$puerto" "/etc/tomcat/server.xml"
         fn_tomcat_security "/usr/share/tomcat"
+
         local ver_real
         ver_real=$(rpm -q tomcat 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         [ -z "$ver_real" ] && ver_real="desconocida"
+
         fn_crear_index "Tomcat" "$ver_real" "$puerto" "/var/lib/tomcat/webapps/ROOT"
         fn_configurar_firewall "$puerto" 8080
+
         systemctl enable tomcat 2>/dev/null
-        systemctl restart tomcat
+        if systemctl restart tomcat; then
+            fn_ok "Servicio tomcat iniciado."
+        else
+            fn_err "Tomcat no pudo iniciar."
+            systemctl status tomcat --no-pager -n 20
+            return 1
+        fi
     else
         fn_warn "Tomcat no en repositorio. Instalando desde binario Apache..."
-        fn_tomcat_desde_binario "$puerto"
+        fn_tomcat_desde_binario "$puerto" || return 1
     fi
 
     fn_section "Tomcat listo"
@@ -484,11 +508,18 @@ fn_tomcat_desde_binario() {
     fn_info "Instalando Tomcat $ver_tomcat..."
 
     curl -L -o /tmp/tomcat.tar.gz \
-        "https://downloads.apache.org/tomcat/tomcat-10/v${ver_tomcat}/bin/apache-tomcat-${ver_tomcat}.tar.gz"
+        "https://downloads.apache.org/tomcat/tomcat-10/v${ver_tomcat}/bin/apache-tomcat-${ver_tomcat}.tar.gz" || {
+        fn_err "No se pudo descargar Tomcat."
+        return 1
+    }
 
     local destino="/opt/tomcat"
     mkdir -p "$destino"
-    tar -xzf /tmp/tomcat.tar.gz -C "$destino" --strip-components=1
+    tar -xzf /tmp/tomcat.tar.gz -C "$destino" --strip-components=1 || {
+        fn_err "No se pudo extraer Tomcat."
+        rm -f /tmp/tomcat.tar.gz
+        return 1
+    }
     rm -f /tmp/tomcat.tar.gz
 
     fn_tomcat_usuario
@@ -501,7 +532,7 @@ fn_tomcat_desde_binario() {
     fn_crear_index "Tomcat" "$ver_tomcat" "$puerto" "$destino/webapps/ROOT"
     fn_configurar_firewall "$puerto" 8080
 
-    cat > /etc/systemd/system/tomcat.service << SVCEOF
+    cat > /etc/systemd/system/tomcat.service <<SVCEOF
 [Unit]
 Description=Apache Tomcat Web Server
 After=network.target
@@ -522,8 +553,13 @@ SVCEOF
 
     systemctl daemon-reload
     systemctl enable tomcat 2>/dev/null
-    systemctl restart tomcat
-    fn_ok "Tomcat $ver_tomcat instalado e iniciado."
+    if systemctl restart tomcat; then
+        fn_ok "Tomcat $ver_tomcat instalado e iniciado."
+    else
+        fn_err "Tomcat no pudo iniciar."
+        systemctl status tomcat --no-pager -n 20
+        return 1
+    fi
 }
 
 fn_tomcat_usuario() {
@@ -538,15 +574,19 @@ fn_tomcat_usuario() {
 fn_tomcat_puerto() {
     local puerto="$1"
     local serverxml="$2"
+
     if [ -f "$serverxml" ]; then
-        sed -i "s/Connector port=\"[0-9]*\" protocol=\"HTTP/Connector port=\"$puerto\" protocol=\"HTTP/" "$serverxml"
+        sed -i 's/Connector port="[0-9]*" protocol="HTTP/Connector port="'"$puerto"'" protocol="HTTP/' "$serverxml"
         fn_ok "Puerto $puerto configurado en server.xml."
+    else
+        fn_warn "No se encontro server.xml en $serverxml"
     fi
 }
 
 fn_tomcat_security() {
     local tomcat_home="$1"
     local webxml="$tomcat_home/conf/web.xml"
+
     if [ -f "$webxml" ] && ! grep -q "httpHeaderSecurity" "$webxml"; then
         sed -i 's|</web-app>|<filter><filter-name>httpHeaderSecurity</filter-name><filter-class>org.apache.catalina.filters.HttpHeaderSecurityFilter</filter-class><init-param><param-name>antiClickJackingOption</param-name><param-value>SAMEORIGIN</param-value></init-param></filter><filter-mapping><filter-name>httpHeaderSecurity</filter-name><url-pattern>/*</url-pattern></filter-mapping></web-app>|' "$webxml"
         fn_ok "Seguridad Tomcat aplicada."
@@ -566,32 +606,64 @@ fn_cambiar_puerto() {
     case "$servicio" in
         apache|httpd)
             sed -i "s/^Listen .*/Listen $puerto_nuevo/" /etc/httpd/conf/httpd.conf
-            sed -i "s/^ServerName .*/ServerName localhost:$puerto_nuevo/" /etc/httpd/conf/httpd.conf
-            local ver
-            ver=$(httpd -v 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-            fn_crear_index "Apache" "$ver" "$puerto_nuevo" "/var/www/html"
-            fn_configurar_firewall "$puerto_nuevo" "$puerto_ant"
-            systemctl restart httpd
-            fn_ok "Puerto Apache cambiado a $puerto_nuevo."
+            if grep -qE '^ServerName ' /etc/httpd/conf/httpd.conf; then
+                sed -i "s|^ServerName .*|ServerName localhost:$puerto_nuevo|" /etc/httpd/conf/httpd.conf
+            else
+                echo "ServerName localhost:$puerto_nuevo" >> /etc/httpd/conf/httpd.conf
+            fi
+
+            local ver_apache
+            ver_apache=$(httpd -v 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            fn_crear_index "Apache" "$ver_apache" "$puerto_nuevo" "/var/www/html"
+            fn_configurar_firewall "$puerto_nuevo" "${puerto_ant:-0}"
+
+            if httpd -t && systemctl restart httpd; then
+                fn_ok "Puerto Apache cambiado a $puerto_nuevo."
+            else
+                fn_err "Apache no pudo reiniciar con el nuevo puerto."
+                systemctl status httpd --no-pager -n 20
+                return 1
+            fi
             ;;
         nginx)
-            sed -i "s/listen\s\+[0-9]\+/listen       $puerto_nuevo/" /etc/nginx/conf.d/practica6.conf
-            local ver
-            ver=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-            fn_crear_index "Nginx" "$ver" "$puerto_nuevo" "/var/www/nginx"
-            fn_configurar_firewall "$puerto_nuevo" "$puerto_ant"
-            systemctl restart nginx
-            fn_ok "Puerto Nginx cambiado a $puerto_nuevo."
+            sed -i -E "s/listen[[:space:]]+[0-9]+;/listen       $puerto_nuevo;/" /etc/nginx/conf.d/practica6.conf
+
+            local ver_nginx
+            ver_nginx=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            fn_crear_index "Nginx" "$ver_nginx" "$puerto_nuevo" "/var/www/nginx"
+            fn_configurar_firewall "$puerto_nuevo" "${puerto_ant:-0}"
+
+            if nginx -t && systemctl restart nginx; then
+                fn_ok "Puerto Nginx cambiado a $puerto_nuevo."
+            else
+                fn_err "No se pudo reiniciar Nginx con el nuevo puerto."
+                systemctl status nginx --no-pager -n 20
+                return 1
+            fi
             ;;
         tomcat)
             local serverxml
             serverxml=$(find /opt/tomcat /usr/share/tomcat /etc/tomcat -name server.xml 2>/dev/null | head -1)
+
             if [ -f "$serverxml" ]; then
-                sed -i "s/Connector port=\"[0-9]*\" protocol=\"HTTP/Connector port=\"$puerto_nuevo\" protocol=\"HTTP/" "$serverxml"
-                fn_configurar_firewall "$puerto_nuevo" "$puerto_ant"
-                systemctl restart tomcat
-                fn_ok "Puerto Tomcat cambiado a $puerto_nuevo."
+                sed -i 's/Connector port="[0-9]*" protocol="HTTP/Connector port="'"$puerto_nuevo"'" protocol="HTTP/' "$serverxml"
+                fn_configurar_firewall "$puerto_nuevo" "${puerto_ant:-0}"
+
+                if systemctl restart tomcat; then
+                    fn_ok "Puerto Tomcat cambiado a $puerto_nuevo."
+                else
+                    fn_err "Tomcat no pudo reiniciar con el nuevo puerto."
+                    systemctl status tomcat --no-pager -n 20
+                    return 1
+                fi
+            else
+                fn_err "No se encontro server.xml para Tomcat."
+                return 1
             fi
+            ;;
+        *)
+            fn_err "Servicio no valido: $servicio"
+            return 1
             ;;
     esac
 }
