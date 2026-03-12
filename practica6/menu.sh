@@ -2,16 +2,11 @@
 # ==============================================================================
 # menu.sh - Menu interactivo de aprovisionamiento HTTP
 # Practica 6 | Mageia 9 x86_64
-# MAIN SCRIPT: solo contiene llamadas a funciones de http_functions.sh
 # Uso: sudo ./menu.sh
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/http_functions.sh"
-
-# ------------------------------------------------------------------------------
-# CABECERA Y ESTADO DE SERVICIOS
-# ------------------------------------------------------------------------------
 
 show_header() {
     clear
@@ -34,6 +29,7 @@ show_service_status() {
         local nombre="${entry##*:}"
         local puerto
         puerto=$(fn_get_puerto_actual "$svc")
+        [ -z "$puerto" ] && puerto="N/D"
 
         if systemctl is-active "$svc" &>/dev/null; then
             echo -e "    ${GREEN}[+] $nombre   activo   puerto: $puerto${NC}"
@@ -45,13 +41,9 @@ show_service_status() {
     done
 }
 
-# ------------------------------------------------------------------------------
-# MENU PRINCIPAL
-# ------------------------------------------------------------------------------
-
 show_main_menu() {
     show_header
-    echo -e "  ${NC}============  MENU PRINCIPAL  ============"
+    echo -e "  ============  MENU PRINCIPAL  ============"
     echo ""
     echo -e "  ${CYAN}-- Instalacion -----------------------------${NC}"
     echo -e "  ${GREEN} 1)  Instalar Apache (httpd)${NC}"
@@ -72,10 +64,6 @@ show_main_menu() {
     echo ""
     echo -n "  Selecciona una opcion [0-9]: "
 }
-
-# ------------------------------------------------------------------------------
-# FLUJOS DE INSTALACION
-# ------------------------------------------------------------------------------
 
 flow_apache() {
     fn_section "Flujo de instalacion: Apache"
@@ -100,10 +88,6 @@ flow_tomcat() {
     puerto=$(fn_solicitar_puerto "Tomcat" 8081)
     fn_install_tomcat "$puerto"
 }
-
-# ------------------------------------------------------------------------------
-# SUBMENU: Gestion de servicios
-# ------------------------------------------------------------------------------
 
 show_manage_menu() {
     show_header
@@ -131,35 +115,50 @@ show_manage_menu() {
     read -rp "  Accion [0-4]: " accion
 
     case "$accion" in
-        1) systemctl start   "$svcname" && fn_ok "$svcname iniciado."   ;;
-        2) systemctl stop    "$svcname" && fn_ok "$svcname detenido."   ;;
-        3) systemctl restart "$svcname" && fn_ok "$svcname reiniciado." ;;
-        4) systemctl status  "$svcname" ;;
+        1)
+            if systemctl start "$svcname"; then
+                fn_ok "$svcname iniciado."
+            else
+                fn_err "No se pudo iniciar $svcname."
+                systemctl status "$svcname" --no-pager -n 20
+            fi
+            ;;
+        2)
+            if systemctl stop "$svcname"; then
+                fn_ok "$svcname detenido."
+            else
+                fn_err "No se pudo detener $svcname."
+                systemctl status "$svcname" --no-pager -n 20
+            fi
+            ;;
+        3)
+            if systemctl restart "$svcname"; then
+                fn_ok "$svcname reiniciado."
+            else
+                fn_err "No se pudo reiniciar $svcname."
+                systemctl status "$svcname" --no-pager -n 20
+            fi
+            ;;
+        4)
+            systemctl status "$svcname"
+            ;;
         0) return ;;
         *) fn_warn "Opcion invalida." ;;
     esac
 }
-
-# ------------------------------------------------------------------------------
-# SUBMENU: Ver puertos activos
-# ------------------------------------------------------------------------------
 
 show_ports_status() {
     show_header
     echo "  ============  PUERTOS ACTIVOS POR SERVICIO  ============"
     echo ""
     echo "  Configuracion en archivos:"
-    echo "   Apache : puerto $(fn_get_puerto_actual apache)"
+    echo "   Apache : puerto $(fn_get_puerto_actual httpd)"
     echo "   Nginx  : puerto $(fn_get_puerto_actual nginx)"
     echo "   Tomcat : puerto $(fn_get_puerto_actual tomcat)"
     echo ""
     echo "  Puertos realmente en escucha (ss -tlnp):"
     ss -tlnp 2>/dev/null | grep -E 'LISTEN' | awk '{print "   " $4 "\t" $6}' | sort
 }
-
-# ------------------------------------------------------------------------------
-# SUBMENU: Ver logs
-# ------------------------------------------------------------------------------
 
 show_logs_menu() {
     show_header
@@ -174,12 +173,10 @@ show_logs_menu() {
 
     case "$sel" in
         1)
-            local log="/var/log/httpd/error_log"
-            [ -f "$log" ] && tail -30 "$log" || fn_warn "No se encontro $log"
+            [ -f /var/log/httpd/error_log ] && tail -30 /var/log/httpd/error_log || fn_warn "No se encontro /var/log/httpd/error_log"
             ;;
         2)
-            local log="/var/log/nginx/error.log"
-            [ -f "$log" ] && tail -30 "$log" || fn_warn "No se encontro $log"
+            [ -f /var/log/nginx/error.log ] && tail -30 /var/log/nginx/error.log || fn_warn "No se encontro /var/log/nginx/error.log"
             ;;
         3)
             journalctl -u tomcat -n 30 --no-pager 2>/dev/null || fn_warn "Sin logs de tomcat."
@@ -189,16 +186,12 @@ show_logs_menu() {
     esac
 }
 
-# ------------------------------------------------------------------------------
-# SUBMENU: Cambiar puerto
-# ------------------------------------------------------------------------------
-
 show_change_port_menu() {
     show_header
     echo "  ============  CAMBIAR PUERTO  ============"
     echo ""
     echo "   Puerto actual de cada servicio:"
-    echo "   Apache : $(fn_get_puerto_actual apache)"
+    echo "   Apache : $(fn_get_puerto_actual httpd)"
     echo "   Nginx  : $(fn_get_puerto_actual nginx)"
     echo "   Tomcat : $(fn_get_puerto_actual tomcat)"
     echo ""
@@ -213,19 +206,25 @@ show_change_port_menu() {
     local svcname="${svc_map[$sel]}"
     [ -z "$svcname" ] && return
 
+    local default_port
+    case "$svcname" in
+        apache) default_port=80 ;;
+        nginx) default_port=8080 ;;
+        tomcat) default_port=8081 ;;
+        *) default_port=8080 ;;
+    esac
+
     local puerto_nuevo
-    puerto_nuevo=$(fn_solicitar_puerto "$svcname" 8080)
-    fn_cambiar_puerto "$svcname" "$puerto_nuevo"
+    puerto_nuevo=$(fn_solicitar_puerto "$svcname" "$default_port")
+    fn_cambiar_puerto "$svcname" "$puerto_nuevo" || return 1
 
     echo ""
     fn_info "Verificando respuesta del servidor..."
     sleep 1
-    curl -sI "http://localhost:$puerto_nuevo" | head -5
+    if ! curl -sI "http://localhost:$puerto_nuevo" | head -5; then
+        fn_err "No hubo respuesta HTTP en el puerto $puerto_nuevo"
+    fi
 }
-
-# ------------------------------------------------------------------------------
-# SUBMENU: Ver encabezados HTTP
-# ------------------------------------------------------------------------------
 
 show_http_headers() {
     show_header
@@ -244,12 +243,10 @@ show_http_headers() {
     echo ""
     echo -e "  ${CYAN}Consultando: $url${NC}"
     echo "  ------------------------------------------"
-    curl -I --max-time 5 "$url"
+    if ! curl -I --max-time 5 "$url"; then
+        fn_err "No se pudo obtener respuesta HTTP desde $url"
+    fi
 }
-
-# ------------------------------------------------------------------------------
-# SUBMENU: Liberar puertos
-# ------------------------------------------------------------------------------
 
 show_free_ports_menu() {
     show_header
@@ -265,9 +262,15 @@ show_free_ports_menu() {
     read -rp "  Selecciona [0-5]: " sel
 
     case "$sel" in
-        1) systemctl stop httpd  && fn_ok "Apache detenido."  ;;
-        2) systemctl stop nginx  && fn_ok "Nginx detenido."   ;;
-        3) systemctl stop tomcat && fn_ok "Tomcat detenido."  ;;
+        1)
+            if systemctl stop httpd; then fn_ok "Apache detenido."; else fn_err "No se pudo detener Apache."; fi
+            ;;
+        2)
+            if systemctl stop nginx; then fn_ok "Nginx detenido."; else fn_err "No se pudo detener Nginx."; fi
+            ;;
+        3)
+            if systemctl stop tomcat; then fn_ok "Tomcat detenido."; else fn_err "No se pudo detener Tomcat."; fi
+            ;;
         4)
             systemctl stop httpd nginx tomcat 2>/dev/null
             fn_ok "Todos los servicios detenidos."
@@ -275,16 +278,12 @@ show_free_ports_menu() {
         5)
             echo ""
             echo "  Puertos en escucha actualmente:"
-            ss -tlnp | grep LISTEN | awk '{print "   " $4}' | sort
+            ss -tlnp 2>/dev/null | grep LISTEN | awk '{print "   " $4}' | sort
             ;;
         0) return ;;
         *) fn_warn "Opcion invalida." ;;
     esac
 }
-
-# ------------------------------------------------------------------------------
-# MAIN - solo llamadas a funciones
-# ------------------------------------------------------------------------------
 
 main() {
     fn_check_root
@@ -294,14 +293,14 @@ main() {
         read -r opcion
 
         case "$opcion" in
-            1) flow_apache          ;;
-            2) flow_nginx           ;;
-            3) flow_tomcat          ;;
-            4) show_manage_menu     ;;
-            5) show_ports_status    ;;
-            6) show_logs_menu       ;;
+            1) flow_apache ;;
+            2) flow_nginx ;;
+            3) flow_tomcat ;;
+            4) show_manage_menu ;;
+            5) show_ports_status ;;
+            6) show_logs_menu ;;
             7) show_change_port_menu ;;
-            8) show_http_headers    ;;
+            8) show_http_headers ;;
             9) show_free_ports_menu ;;
             0)
                 echo ""
