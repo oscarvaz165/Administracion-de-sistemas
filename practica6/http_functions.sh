@@ -45,9 +45,10 @@ check_port() {
 }
 
 # Funcion para validar que el puerto este en el rango valido
+# Bloquea puertos < 1024 para evitar el error "Permiso denegado" en Tomcat
 is_reserved_port() {
     local port=$1
-    if [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then
+    if [[ "$port" -lt 1024 || "$port" -gt 65535 ]]; then
         return 0 # Fuera de rango (invalido)
     fi
     return 1 # En rango (valido)
@@ -175,6 +176,7 @@ install_apache() {
     apply_security_config "httpd" "$apache_root"
     create_custom_index "Apache" "$version" "$port" "$apache_root"
 
+    iptables -A INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
     firewall-cmd --permanent --add-port=$port/tcp 2>/dev/null
     firewall-cmd --reload 2>/dev/null
 
@@ -205,6 +207,7 @@ install_nginx() {
     apply_security_config "nginx" "$nginx_root"
     create_custom_index "Nginx" "$version" "$port" "$nginx_root"
 
+    iptables -A INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
     firewall-cmd --permanent --add-port=$port/tcp 2>/dev/null
     firewall-cmd --reload 2>/dev/null
 
@@ -215,70 +218,50 @@ install_nginx() {
     echo -e "  ${GREEN}Webroot : $nginx_root${NC}"
 }
 
-# Instalacion y configuracion de Tomcat (manual .tar.gz)
+# Instalacion y configuracion de Tomcat (repositorio Mageia)
 install_tomcat() {
     local port=$1
-    local version="9.0.86"
 
-    fn_section "Instalando Tomcat $version en Mageia"
+    fn_section "Instalando Tomcat en Mageia"
 
     if ! command -v java &>/dev/null; then
         fn_info "Instalando Java (OpenJDK)..."
         dnf install -y java-1.8.0-openjdk-devel 2>/dev/null || urpmi --auto java-1.8.0-openjdk-devel
     fi
 
-    local java_path=$(readlink -f $(command -v java) | sed "s:/bin/java::")
-    fn_info "JAVA_HOME detectado en: $java_path"
+    fn_info "Instalando Tomcat desde repositorio..."
+    dnf install -y tomcat 2>/dev/null || urpmi --auto tomcat
 
-    if ! id "tomcat" &>/dev/null; then
-        useradd -m -U -d /opt/tomcat -s /bin/false tomcat 2>/dev/null
-        fn_ok "Usuario 'tomcat' creado."
+    # Obtener version instalada
+    local version
+    version=$(rpm -q tomcat 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    [ -z "$version" ] && version="desconocida"
+    fn_ok "Tomcat $version instalado."
+
+    # Configurar puerto HTTP en server.xml (solo el Connector HTTP, no el shutdown)
+    local serverxml="/etc/tomcat/server.xml"
+    if [ -f "$serverxml" ]; then
+        # Cambiar solo el Connector HTTP/1.1, agregar address="0.0.0.0"
+        sed -i "s|<Connector port=\"8080\" protocol=\"HTTP/1.1\"|<Connector port=\"$port\" address=\"0.0.0.0\" protocol=\"HTTP/1.1\"|" "$serverxml"
+        fn_ok "Puerto $port configurado en server.xml."
     fi
 
-    cd /tmp
-    [ ! -f "apache-tomcat-$version.tar.gz" ] && \
-        wget -q https://archive.apache.org/dist/tomcat/tomcat-9/v$version/bin/apache-tomcat-$version.tar.gz
-    mkdir -p /opt/tomcat
-    tar xzvf apache-tomcat-$version.tar.gz -C /opt/tomcat --strip-components=1 > /dev/null
-    fn_ok "Tomcat extraido en /opt/tomcat."
+    # Crear index en el webroot correcto del repositorio
+    local webroot="/var/lib/tomcat/webapps/ROOT"
+    create_custom_index "Tomcat" "$version" "$port" "$webroot"
+    chown -R tomcat:tomcat "$webroot" 2>/dev/null
 
-    chown -R tomcat:tomcat /opt/tomcat
-    chmod -R 750 /opt/tomcat/conf
-
-    sed -i "s/Connector port=\"8080\"/Connector port=\"$port\"/" /opt/tomcat/conf/server.xml
-    fn_ok "Puerto $port configurado en server.xml."
-
-    create_custom_index "Tomcat" "$version" "$port" "/opt/tomcat/webapps/ROOT"
-
-    cat > /etc/systemd/system/tomcat.service << SVCEOF
-[Unit]
-Description=Apache Tomcat 9 Web Application Container
-After=network.target
-
-[Service]
-Type=forking
-User=tomcat
-Group=tomcat
-Environment="JAVA_HOME=$java_path"
-Environment="CATALINA_PID=/opt/tomcat/temp/tomcat.pid"
-Environment="CATALINA_HOME=/opt/tomcat"
-ExecStart=/opt/tomcat/bin/startup.sh
-ExecStop=/opt/tomcat/bin/shutdown.sh
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-
-    systemctl daemon-reload
-    systemctl enable tomcat 2>/dev/null
-    systemctl start tomcat
-
+    iptables -A INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
     firewall-cmd --permanent --add-port=$port/tcp 2>/dev/null
     firewall-cmd --reload 2>/dev/null
 
+    systemctl enable tomcat 2>/dev/null
+    systemctl restart tomcat
+    sleep 3
+
     fn_ok "Tomcat $version configurado en el puerto $port."
     echo -e "  ${GREEN}URL     : http://localhost:$port${NC}"
-    echo -e "  ${GREEN}Webroot : /opt/tomcat/webapps/ROOT${NC}"
+    echo -e "  ${GREEN}Webroot : $webroot${NC}"
 }
 
 # Funcion para bajar servicios
@@ -342,9 +325,8 @@ purge_services() {
             ;;
         tomcat)
             systemctl stop tomcat 2>/dev/null
-            rm -rf /opt/tomcat /etc/systemd/system/tomcat.service
-            systemctl daemon-reload
-            if id "tomcat" &>/dev/null; then userdel -r tomcat 2>/dev/null; fi
+            dnf remove -y tomcat 2>/dev/null || urpme tomcat 2>/dev/null
+            rm -rf /var/lib/tomcat /etc/tomcat /var/log/tomcat
             ;;
     esac
     fn_ok "Limpieza de $service completada."
