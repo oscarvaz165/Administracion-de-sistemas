@@ -45,10 +45,9 @@ check_port() {
 }
 
 # Funcion para validar que el puerto este en el rango valido
-# Bloquea puertos < 1024 para evitar el error "Permiso denegado" en Tomcat
 is_reserved_port() {
     local port=$1
-    if [[ "$port" -lt 1024 || "$port" -gt 65535 ]]; then
+    if [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then
         return 0 # Fuera de rango (invalido)
     fi
     return 1 # En rango (valido)
@@ -254,6 +253,22 @@ install_tomcat() {
     iptables -A INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
     firewall-cmd --permanent --add-port=$port/tcp 2>/dev/null
     firewall-cmd --reload 2>/dev/null
+
+    # Puertos < 1024 requieren authbind en Linux
+    if [[ "$port" -lt 1024 ]]; then
+        fn_info "Puerto $port < 1024, configurando authbind..."
+        dnf install -y authbind 2>/dev/null || urpmi --auto authbind 2>/dev/null
+        mkdir -p /etc/authbind/byport
+        touch /etc/authbind/byport/$port
+        chmod 500 /etc/authbind/byport/$port
+        chown tomcat /etc/authbind/byport/$port
+        local svc_file="/usr/lib/systemd/system/tomcat.service"
+        if [ -f "$svc_file" ]; then
+            sed -i 's|ExecStart=\(.*\)|ExecStart=/usr/bin/authbind --deep \1|' "$svc_file" 2>/dev/null || true
+        fi
+        systemctl daemon-reload
+        fn_ok "authbind configurado para puerto $port."
+    fi
 
     systemctl enable tomcat 2>/dev/null
     systemctl restart tomcat
