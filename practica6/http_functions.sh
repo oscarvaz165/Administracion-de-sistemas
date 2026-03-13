@@ -240,7 +240,9 @@ install_tomcat() {
     # Configurar puerto en ambos server.xml (repositorio usa /usr/share/tomcat/conf)
     for serverxml in "/etc/tomcat/server.xml" "/usr/share/tomcat/conf/server.xml"; do
         if [ -f "$serverxml" ]; then
-            sed -i "s|Connector port=\"[0-9]*\" protocol=\"HTTP/1.1\"|Connector port=\"$port\" address=\"0.0.0.0\" protocol=\"HTTP/1.1\"|" "$serverxml"
+            # Reemplaza cualquier puerto existente en el Connector HTTP (con o sin address)
+            sed -i "s|Connector port=\"[0-9]*\" address=\"[^\"]*\" protocol=\"HTTP/1.1\"|Connector port=\"$port\" address=\"0.0.0.0\" protocol=\"HTTP/1.1\"|g" "$serverxml"
+            sed -i "s|Connector port=\"[0-9]*\" protocol=\"HTTP/1.1\"|Connector port=\"$port\" address=\"0.0.0.0\" protocol=\"HTTP/1.1\"|g" "$serverxml"
             fn_ok "Puerto $port configurado en $serverxml."
         fi
     done
