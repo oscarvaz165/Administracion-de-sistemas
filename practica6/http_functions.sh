@@ -2,16 +2,30 @@
 
 # ==============================================================================
 # Practica-06: http_functions.sh
-# Librería de funciones para aprovisionamiento web automatizado en Linux
+# Libreria de funciones para aprovisionamiento web automatizado en Linux
 # ==============================================================================
 
-# Colores para la interfaz
-GREEN='\033[0;32m'
+# Colores
 RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-# Función para validar entrada (evitar caracteres especiales y nulos)
+fn_info()    { echo -e "${CYAN}  [INFO]  $1${NC}"; }
+fn_ok()      { echo -e "${GREEN}  [OK]    $1${NC}"; }
+fn_warn()    { echo -e "${YELLOW}  [WARN]  $1${NC}"; }
+fn_err()     { echo -e "${RED}  [ERROR] $1${NC}"; }
+fn_section() {
+    echo ""
+    echo -e "${BLUE}  ==================================================${NC}"
+    echo -e "${BLUE}    $1${NC}"
+    echo -e "${BLUE}  ==================================================${NC}"
+    echo ""
+}
+
+# Funcion para validar entrada (evitar caracteres especiales y nulos)
 validate_input() {
     local input="$1"
     if [[ -z "$input" || "$input" =~ [^a-zA-Z0-9._-] ]]; then
@@ -20,7 +34,7 @@ validate_input() {
     return 0
 }
 
-# Función para verificar si un puerto está ocupado
+# Funcion para verificar si un puerto esta ocupado
 check_port() {
     local port=$1
     if lsof -Pi :$port -sTCP:LISTEN -t >/dev/null ; then
@@ -30,291 +44,278 @@ check_port() {
     fi
 }
 
-# Función para validar que el puerto esté en el rango válido
+# Funcion para validar que el puerto este en el rango valido
 is_reserved_port() {
     local port=$1
     if [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then
-        return 0 # Fuera de rango (inválido)
+        return 0 # Fuera de rango (invalido)
     fi
-    return 1 # En rango (válido)
+    return 1 # En rango (valido)
 }
 
-# Listar versiones dinámicamente (Adaptado para Mageia/DNF o URPMI)
+# Listar versiones dinamicamente (Adaptado para Mageia/DNF o URPMI)
 get_versions() {
     local service=$1
-    echo -e "${BLUE}Consultando versiones en repositorios de Mageia para $service...${NC}"
-    
+    fn_info "Consultando versiones en repositorios de Mageia para $service..."
+
     if command -v dnf &> /dev/null; then
-        # DNF es el estándar en Mageia moderno
         dnf --showduplicates list "$service" 2>/dev/null | awk '{print $2}' | grep -E '^[0-9]' | head -n 5
     elif command -v urpmq &> /dev/null; then
-        # Respaldo para urpmi
         urpmq -m "$service" | head -n 5
     else
-        echo -e "${RED}[AVISO] No se detectó dnf ni urpmi. Escriba 'latest'.${NC}"
+        fn_warn "No se detecto dnf ni urpmi. Escriba 'latest'."
     fi
 }
 
-# Configuración de Seguridad General (Mageia/RedHat Paths)
+# Configuracion de Seguridad General (Mageia/RedHat Paths)
 apply_security_config() {
     local service=$1
     local web_root=$2
-    
-    echo -e "${BLUE}Aplicando endurecimiento (security hardening) para $service...${NC}"
-    
+
+    fn_section "Hardening de seguridad: $service"
+
     case $service in
         apache2|httpd)
             local CONF="/etc/httpd/conf/httpd.conf"
             [ ! -f "$CONF" ] && CONF="/etc/apache2/httpd.conf"
-            
-            # Ocultar versión y firma de forma segura (evita duplicados)
+
             sed -i "s/^ServerTokens .*/ServerTokens Prod/" "$CONF" 2>/dev/null
             grep -q "^ServerTokens Prod" "$CONF" || echo "ServerTokens Prod" >> "$CONF"
-            
             sed -i "s/^ServerSignature .*/ServerSignature Off/" "$CONF" 2>/dev/null
             grep -q "^ServerSignature Off" "$CONF" || echo "ServerSignature Off" >> "$CONF"
-            
             grep -q "^TraceEnable Off" "$CONF" || echo "TraceEnable Off" >> "$CONF"
-            
-            # Verificar sintaxis antes de intentar arrancar
-            echo -e "${BLUE}Validando configuración de Apache...${NC}"
+
+            fn_info "Validando configuracion de Apache..."
             if apachectl configtest &>/dev/null; then
                 systemctl restart httpd 2>/dev/null || systemctl restart apache2 2>/dev/null
+                fn_ok "Apache reiniciado correctamente."
             else
-                echo -e "${RED}[ALERTA] Error de sintaxis en httpd.conf detectado:${NC}"
+                fn_err "Error de sintaxis en httpd.conf:"
                 apachectl configtest
             fi
             ;;
         nginx)
-            # Hardening Nginx
             sed -i "s/server_tokens on;/server_tokens off;/" /etc/nginx/nginx.conf
-            grep -q "server_tokens off;" /etc/nginx/nginx.conf || sed -i '/http {/a \    server_tokens off;' /etc/nginx/nginx.conf
-            
+            grep -q "server_tokens off;" /etc/nginx/nginx.conf || \
+                sed -i '/http {/a \    server_tokens off;' /etc/nginx/nginx.conf
+
             if nginx -t &>/dev/null; then
                 systemctl restart nginx
+                fn_ok "Nginx reiniciado correctamente."
             else
-                echo -e "${RED}[ALERTA] Error de sintaxis en nginx.conf detectado.${NC}"
+                fn_err "Error de sintaxis en nginx.conf:"
                 nginx -t
             fi
             ;;
     esac
 }
 
-# Crear página index.html simple
+# Crear pagina index.html personalizada
 create_custom_index() {
     local service=$1
     local version=$2
     local port=$3
     local path=$4
-    
-    # Asegurar que el directorio existe (evita errores tras una purga)
+
     mkdir -p "$path"
-    
-    cat <<EOF > "$path/index.html"
-Servidor: $service
-Versión: $version
-Puerto: $port
-EOF
-    # Ajustar permisos para Mageia (apache) y fallback para otros (www-data)
+
+    cat > "$path/index.html" << HTMLEOF
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>$service - Practica 6</title>
+    <style>
+        body { font-family: sans-serif; background: #1a1a2e; color: #eee;
+               display: flex; justify-content: center; align-items: center;
+               height: 100vh; margin: 0; }
+        .card { background: #16213e; border-radius: 12px; padding: 40px 60px;
+                box-shadow: 0 8px 32px rgba(0,0,0,.5); text-align: center; }
+        h1 { color: #4fc3f7; font-size: 2.2em; margin-bottom: .3em; }
+        .badge { display: inline-block; background: #e94560; color: #fff;
+                 border-radius: 6px; padding: 4px 14px; font-size: .9em; margin: 6px 4px; }
+        .info { color: #a8b2d8; margin-top: 1em; font-size: .95em; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>$service</h1>
+        <div>
+            <span class="badge">Servidor: $service</span>
+            <span class="badge">Version: $version</span>
+            <span class="badge">Puerto: $port</span>
+        </div>
+        <p class="info">Aprovisionado automaticamente - Practica 6 - Mageia 9</p>
+    </div>
+</body>
+</html>
+HTMLEOF
+
     chown -R apache:apache "$path" 2>/dev/null || chown -R www-data:www-data "$path" 2>/dev/null
+    fn_ok "index.html creado en $path"
 }
 
-# Instalación de Apache (Mageia: apache)
+# Instalacion de Apache (Mageia: apache)
 install_apache() {
     local version=$1
     local port=$2
-    
-    echo -e "${BLUE}Instalando Apache en Mageia...${NC}"
+
+    fn_section "Instalando Apache en Mageia"
     dnf install -y apache 2>/dev/null || urpmi --auto apache
-    
-    # [FUERZA BRUTA] Cambiar Listen en TODOS los archivos de configuración
-    echo -e "${BLUE}Forzando cambio de puerto en todos los archivos de Apache...${NC}"
+
+    fn_info "Forzando cambio de puerto en todos los archivos de Apache..."
     find /etc/httpd -name "*.conf" -exec sed -i "s/^Listen\s\+[0-9]\+/Listen $port/g" {} +
-    # Fallback para rutas alternativas
     find /etc/apache2 -name "*.conf" -exec sed -i "s/^Listen\s\+[0-9]\+/Listen $port/g" {} + 2>/dev/null
-    
-    # Crear directorio raíz específico para Apache
+
     local apache_root="/var/www/html/apache"
     mkdir -p "$apache_root"
-    # Cambiar DocumentRoot en la configuración para que no choque con otros servicios
     sed -i "s|DocumentRoot \"/var/www/html\"|DocumentRoot \"$apache_root\"|g" /etc/httpd/conf/httpd.conf
     sed -i "s|<Directory \"/var/www/html\">|<Directory \"$apache_root\">|g" /etc/httpd/conf/httpd.conf
-    
+
     apply_security_config "httpd" "$apache_root"
-    create_custom_index "Apache/Mageia" "Latest" "$port" "$apache_root"
-    
-    # Firewall Mageia (firewalld)
+    create_custom_index "Apache" "$version" "$port" "$apache_root"
+
+    iptables -A INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
     firewall-cmd --permanent --add-port=$port/tcp 2>/dev/null
     firewall-cmd --reload 2>/dev/null
-    
+
     systemctl enable httpd
     systemctl restart httpd
-    echo -e "${GREEN}Apache configurado en el puerto $port.${NC}"
+    fn_ok "Apache configurado en el puerto $port."
+    echo -e "  ${GREEN}URL     : http://localhost:$port${NC}"
+    echo -e "  ${GREEN}Webroot : $apache_root${NC}"
 }
 
-# Instalación de Nginx (Mageia)
+# Instalacion de Nginx (Mageia)
 install_nginx() {
     local version=$1
     local port=$2
-    
-    echo -e "${BLUE}Instalando Nginx en Mageia...${NC}"
+
+    fn_section "Instalando Nginx en Mageia"
     dnf install -y nginx 2>/dev/null || urpmi --auto nginx
-    
-    # [FUERZA BRUTA] Cambiar listen en TODOS los archivos de configuración (v4 y v6)
-    echo -e "${BLUE}Forzando cambio de puerto en todos los archivos de Nginx...${NC}"
+
+    fn_info "Forzando cambio de puerto en todos los archivos de Nginx..."
     find /etc/nginx -name "*.conf" -exec sed -i "s/listen\s\+[0-9]\+/listen $port/g" {} +
     find /etc/nginx -name "*.conf" -exec sed -i "s/listen\s\+\[::\]:[0-9]\+;/listen [::]:$port;/g" {} +
-    
-    # Crear directorio raíz específico para Nginx
+
     local nginx_root="/var/www/html/nginx"
     mkdir -p "$nginx_root"
-    # Cambiar el path root en el archivo de configuración
     sed -i "s|root\s\+/usr/share/nginx/html;|root $nginx_root;|g" /etc/nginx/nginx.conf
     sed -i "s|root\s\+/var/www/html;|root $nginx_root;|g" /etc/nginx/nginx.conf
-    
+
     apply_security_config "nginx" "$nginx_root"
-    create_custom_index "Nginx/Mageia" "Latest" "$port" "$nginx_root"
-    
+    create_custom_index "Nginx" "$version" "$port" "$nginx_root"
+
+    iptables -A INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
     firewall-cmd --permanent --add-port=$port/tcp 2>/dev/null
     firewall-cmd --reload 2>/dev/null
-    
+
     systemctl enable nginx
     systemctl restart nginx
-    echo -e "${GREEN}Nginx configurado en el puerto $port.${NC}"
+    fn_ok "Nginx configurado en el puerto $port."
+    echo -e "  ${GREEN}URL     : http://localhost:$port${NC}"
+    echo -e "  ${GREEN}Webroot : $nginx_root${NC}"
 }
 
-# Instalación y configuración de Tomcat (MANUAL .tar.gz)
+# Instalacion y configuracion de Tomcat (repositorio Mageia)
 install_tomcat() {
     local port=$1
-    local version="9.0.86" # Versión manual estable
-    
-    echo -e "${BLUE}Preparando entorno para Tomcat...${NC}"
-    
-    # 0. Instalar Java (Requisito indispensable)
+
+    fn_section "Instalando Tomcat en Mageia"
+
     if ! command -v java &>/dev/null; then
-        echo -e "${BLUE}Instalando Java (OpenJDK)...${NC}"
+        fn_info "Instalando Java (OpenJDK)..."
         dnf install -y java-1.8.0-openjdk-devel 2>/dev/null || urpmi --auto java-1.8.0-openjdk-devel
     fi
-    
-    # Detectar JAVA_HOME dinámicamente en Mageia
-    local java_path=$(readlink -f $(command -v java) | sed "s:/bin/java::")
-    echo -e "${BLUE}JAVA_HOME detectado en: $java_path${NC}"
-    
-    echo -e "${BLUE}Instalando Tomcat $version manualmente (Binarios)...${NC}"
-    
-    # 1. Crear usuario dedicado
-    if ! id "tomcat" &>/dev/null; then
-        useradd -m -U -d /opt/tomcat -s /bin/false tomcat 2>/dev/null
+
+    fn_info "Instalando Tomcat desde repositorio..."
+    dnf install -y tomcat 2>/dev/null || urpmi --auto tomcat
+
+    # Obtener version instalada
+    local version
+    version=$(rpm -q tomcat 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    [ -z "$version" ] && version="desconocida"
+    fn_ok "Tomcat $version instalado."
+
+    # Configurar puerto en ambos server.xml (repositorio usa /usr/share/tomcat/conf)
+    for serverxml in "/etc/tomcat/server.xml" "/usr/share/tomcat/conf/server.xml"; do
+        if [ -f "$serverxml" ]; then
+            sed -i "s|Connector port=\"[0-9]*\" protocol=\"HTTP/1.1\"|Connector port=\"$port\" address=\"0.0.0.0\" protocol=\"HTTP/1.1\"|" "$serverxml"
+            fn_ok "Puerto $port configurado en $serverxml."
+        fi
+    done
+
+    # Configurar servicio para correr como root (permite puertos < 1024)
+    local svc_file="/usr/lib/systemd/system/tomcat.service"
+    if [ -f "$svc_file" ]; then
+        sed -i 's/^User=tomcat/User=root/' "$svc_file"
+        fn_ok "Servicio tomcat configurado para correr como root."
     fi
-    
-    # 2. Descargar y extraer
-    cd /tmp
-    [ ! -f "apache-tomcat-$version.tar.gz" ] && wget -q https://archive.apache.org/dist/tomcat/tomcat-9/v$version/bin/apache-tomcat-$version.tar.gz
-    mkdir -p /opt/tomcat
-    tar xzvf apache-tomcat-$version.tar.gz -C /opt/tomcat --strip-components=1 > /dev/null
-    
-    # 3. Permisos restringidos (Requerimiento de seguridad)
-    chown -R tomcat:tomcat /opt/tomcat
-    chmod -R 750 /opt/tomcat/conf
-    
-    # 4. Configurar puerto en server.xml
-    sed -i "s/Connector port=\"8080\"/Connector port=\"$port\"/" /opt/tomcat/conf/server.xml
-    
-    # 5. Crear index personalizado
-    create_custom_index "Tomcat" "$version" "$port" "/opt/tomcat/webapps/ROOT"
-    
-    # 6. Crear servicio systemd
-    cat <<EOF > /etc/systemd/system/tomcat.service
-[Unit]
-Description=Apache Tomcat 9 Web Application Container
-After=network.target
-
-[Service]
-Type=forking
-User=tomcat
-Group=tomcat
-Environment="JAVA_HOME=$java_path"
-Environment="CATALINA_PID=/opt/tomcat/temp/tomcat.pid"
-Environment="CATALINA_HOME=/opt/tomcat"
-ExecStart=/opt/tomcat/bin/startup.sh
-ExecStop=/opt/tomcat/bin/shutdown.sh
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
     systemctl daemon-reload
+
+    # Crear index en el webroot correcto del repositorio
+    local webroot="/var/lib/tomcat/webapps/ROOT"
+    create_custom_index "Tomcat" "$version" "$port" "$webroot"
+
+    iptables -A INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
+
     systemctl enable tomcat 2>/dev/null
-    systemctl start tomcat
-    
-    # Firewall Mageia
-    firewall-cmd --permanent --add-port=$port/tcp 2>/dev/null
-    firewall-cmd --reload 2>/dev/null
-    
-    echo -e "${GREEN}Tomcat configurado manualmente en el puerto $port.${NC}"
+    systemctl restart tomcat
+    sleep 3
+
+    fn_ok "Tomcat $version configurado en el puerto $port."
+    echo -e "  ${GREEN}URL     : http://localhost:$port${NC}"
+    echo -e "  ${GREEN}Webroot : $webroot${NC}"
 }
 
-# Función para bajar servicios
+# Funcion para bajar servicios
 stop_linux_service() {
     local service=$1
-    echo -e "${BLUE}Bajando servicio $service...${NC}"
+    fn_info "Deteniendo servicio $service..."
     case $service in
         apache2|httpd)
-            systemctl stop httpd 2>/dev/null || systemctl stop apache2 2>/dev/null
-            ;;
+            systemctl stop httpd 2>/dev/null || systemctl stop apache2 2>/dev/null ;;
         nginx)
-            systemctl stop nginx 2>/dev/null
-            ;;
+            systemctl stop nginx 2>/dev/null ;;
         tomcat)
-            systemctl stop tomcat 2>/dev/null
-            ;;
+            systemctl stop tomcat 2>/dev/null ;;
     esac
-    echo -e "${GREEN}Servicio $service detenido.${NC}"
+    fn_ok "Servicio $service detenido."
 }
 
-# Función para verificar estado y puertos de los servicios
+# Funcion para verificar estado y puertos de los servicios
 check_services_status() {
-    echo -e "${BLUE}==========================================${NC}"
-    echo -e "${BLUE}       ESTADO DE LOS SERVICIOS WEB        ${NC}"
-    echo -e "${BLUE}==========================================${NC}"
-    printf "%-15s | %-12s | %-10s\n" "SERVICIO" "ESTADO" "PUERTO(S)"
-    echo "------------------------------------------"
+    fn_section "Estado de los servicios web"
+    printf "  ${CYAN}%-15s | %-12s | %-10s${NC}\n" "SERVICIO" "ESTADO" "PUERTO(S)"
+    echo "  ------------------------------------------"
 
-    # Lista de servicios a verificar
     local services=("httpd" "nginx" "tomcat")
-    
+
     for srv in "${services[@]}"; do
-        # Verificar estado
         local status=$(systemctl is-active "$srv" 2>/dev/null)
         if [[ "$status" == "active" ]]; then
-            status_text="Corriendo"
-            color=$GREEN
-            
-            # Buscar puerto: si es tomcat, buscar el proceso 'java'
             local search_pattern="$srv"
             [[ "$srv" == "tomcat" ]] && search_pattern="java"
-            
-            local ports=$(ss -tulpn 2>/dev/null | grep -i "$search_pattern" | awk '{print $5}' | cut -d':' -f2 | sort -u | tr '\n' ',' | sed 's/,$//')
+            local ports=$(ss -tulpn 2>/dev/null | grep -i "$search_pattern" | \
+                awk '{print $5}' | cut -d':' -f2 | sort -u | tr '\n' ',' | sed 's/,$//')
             [[ -z "$ports" ]] && ports="Iniciando..."
+            printf "  %-15s | " "$srv"
+            echo -ne "${GREEN}%-12s${NC}" "Corriendo"
+            printf " | %-10s\n" "$ports"
         else
-            status_text="Detenido"
-            color=$RED
-            ports="-"
+            printf "  %-15s | " "$srv"
+            echo -ne "${RED}%-12s${NC}" "Detenido"
+            printf " | %-10s\n" "-"
         fi
-        
-        # Imprimir fila con formato limpio
-        printf "%-15s | " "$srv"
-        echo -ne "${color}%-12s${NC}" "$status_text"
-        printf " | %-10s\n" "$ports"
     done
-    echo -e "${BLUE}==========================================${NC}"
+    echo "  ------------------------------------------"
 }
 
-# Función para eliminación total de servicios (Purge)
+# Funcion para eliminacion total de servicios (Purge)
 purge_services() {
     local service=$1
-    echo -e "${RED}Eliminando por completo $service (registros, configs y binarios)...${NC}"
-    
+    fn_warn "Eliminando por completo $service (registros, configs y binarios)..."
+
     case $service in
         apache2|httpd)
             systemctl stop httpd 2>/dev/null
@@ -328,10 +329,9 @@ purge_services() {
             ;;
         tomcat)
             systemctl stop tomcat 2>/dev/null
-            rm -rf /opt/tomcat /etc/systemd/system/tomcat.service
-            systemctl daemon-reload
-            if id "tomcat" &>/dev/null; then userdel -r tomcat 2>/dev/null; fi
+            dnf remove -y tomcat 2>/dev/null || urpme tomcat 2>/dev/null
+            rm -rf /var/lib/tomcat /etc/tomcat /var/log/tomcat
             ;;
     esac
-    echo -e "${GREEN}Limpieza de $service completada.${NC}"
+    fn_ok "Limpieza de $service completada."
 }
