@@ -164,8 +164,12 @@ install_apache() {
     dnf install -y apache 2>/dev/null || urpmi --auto apache
 
     fn_info "Forzando cambio de puerto en todos los archivos de Apache..."
-    find /etc/httpd -name "*.conf" -exec sed -i "s/^Listen\s\+[0-9]\+/Listen $port/g" {} +
-    find /etc/apache2 -name "*.conf" -exec sed -i "s/^Listen\s\+[0-9]\+/Listen $port/g" {} + 2>/dev/null
+    # Deshabilitar ssl.conf para evitar conflicto de puertos duplicados
+    for sslf in /etc/httpd/conf/conf.d/ssl.conf /etc/httpd/conf.d/ssl.conf; do
+        [ -f "$sslf" ] && mv "$sslf" "${sslf}.bak" && fn_info "ssl.conf deshabilitado."
+    done
+    find /etc/httpd -name "*.conf" ! -name "*.bak" -exec sed -i "s/^Listen\s\+[0-9]\+/Listen $port/g" {} +
+    find /etc/apache2 -name "*.conf" ! -name "*.bak" -exec sed -i "s/^Listen\s\+[0-9]\+/Listen $port/g" {} + 2>/dev/null
 
     local apache_root="/var/www/html/apache"
     mkdir -p "$apache_root"
